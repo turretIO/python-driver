@@ -468,7 +468,7 @@ class Cluster(object):
 
             if self.control_connection:
                 try:
-                    self.control_connection.connect()
+                    self.control_connection.connect(keyspace)
                     log.debug("Control connection created")
                 except Exception:
                     log.exception("Control connection failed to connect, "
@@ -1348,11 +1348,11 @@ class ControlConnection(object):
         self._reconnection_handler = None
         self._reconnection_lock = RLock()
 
-    def connect(self):
+    def connect(self, keyspace=None):
         if self._is_shutdown:
             return
 
-        self._set_new_connection(self._reconnect_internal())
+        self._set_new_connection(self._reconnect_internal(keyspace))
 
     def _set_new_connection(self, conn):
         """
@@ -1366,7 +1366,7 @@ class ControlConnection(object):
             log.debug("[control connection] Closing old connection %r, replacing with %r", old, conn)
             old.close()
 
-    def _reconnect_internal(self):
+    def _reconnect_internal(self, keyspace=None):
         """
         Tries to connect to each host in the query plan until one succeeds
         or every attempt fails. If successful, a new Connection will be
@@ -1378,7 +1378,7 @@ class ControlConnection(object):
         errors = {}
         for host in self._cluster.load_balancing_policy.make_query_plan():
             try:
-                return self._try_connect(host)
+                return self._try_connect(host, keyspace)
             except ConnectionException as exc:
                 errors[host.address] = exc
                 log.warn("[control connection] Error connecting to %s:", host, exc_info=True)
@@ -1389,7 +1389,7 @@ class ControlConnection(object):
 
         raise NoHostAvailable("Unable to connect to any servers", errors)
 
-    def _try_connect(self, host):
+    def _try_connect(self, host, keyspace=None):
         """
         Creates a new Connection, registers for pushed events, and refreshes
         node/token and schema metadata.
@@ -1408,7 +1408,7 @@ class ControlConnection(object):
             })
 
             self._refresh_node_list_and_token_map(connection)
-            self._refresh_schema(connection)
+            self._refresh_schema(connection, keyspace)
         except Exception:
             connection.close()
             raise
