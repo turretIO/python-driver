@@ -1756,6 +1756,9 @@ class _Scheduler(object):
             log.debug("Ignoring scheduled function after shutdown: %r", fn)
 
     def run(self):
+	# Not sure why we need this here, but Queue.Empty below doesn't work
+	# without this
+	import Queue 
         while True:
             if self.is_shutdown:
                 return
