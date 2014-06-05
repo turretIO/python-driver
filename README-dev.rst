@@ -1,6 +1,8 @@
 Releasing
 =========
 * Run the tests and ensure they all pass
+* If dependencies have changed, make sure ``debian/control``
+  is up to date
 * Update CHANGELOG.rst
 * Update the version in ``cassandra/__init__.py``
 * Commit the changelog and version changes
@@ -41,6 +43,8 @@ For example::
     python setup.py doc
     cp -R docs/_build/1.0.0-beta1/* ~/python-driver-docs/
     cd ~/python-driver-docs
+    git add --all
+    git commit -m 'Update docs'
     git push origin gh-pages
 
 Running the Tests

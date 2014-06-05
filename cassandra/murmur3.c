@@ -100,11 +100,14 @@ uint64_t MurmurHash3_x64_128 (const void * key, const int len,
 
   uint64_t c1 = BIG_CONSTANT(0x87c37b91114253d5);
   uint64_t c2 = BIG_CONSTANT(0x4cf5ad432745937f);
+  uint64_t k1 = 0;
+  uint64_t k2 = 0;
+
+  const uint64_t * blocks = (const uint64_t *)(data);
+  const uint8_t * tail = (const uint8_t*)(data + nblocks*16);
 
   //----------
   // body
-
-  const uint64_t * blocks = (const uint64_t *)(data);
 
   int i;
   for(i = 0; i < nblocks; i++)
@@ -124,11 +127,6 @@ uint64_t MurmurHash3_x64_128 (const void * key, const int len,
 
   //----------
   // tail
-
-  const uint8_t * tail = (const uint8_t*)(data + nblocks*16);
-
-  uint64_t k1 = 0;
-  uint64_t k2 = 0;
 
   switch(len & 15)
   {
@@ -169,40 +167,95 @@ uint64_t MurmurHash3_x64_128 (const void * key, const int len,
   return h1;
 }
 
+
+struct module_state {
+    PyObject *error;
+};
+
+#if PY_MAJOR_VERSION >= 3
+#define GETSTATE(m) ((struct module_state*)PyModule_GetState(m))
+#else
+#define GETSTATE(m) (&_state)
+static struct module_state _state;
+#endif
+
 static PyObject *
 murmur3(PyObject *self, PyObject *args)
 {
     const char *key;
     Py_ssize_t len;
     uint32_t seed = 0;
+    uint64_t result = 0;
+
 
     if (!PyArg_ParseTuple(args, "s#|I", &key, &len, &seed)) {
         return NULL;
     }
 
     // TODO handle x86 version?
-    uint64_t result = MurmurHash3_x64_128((void *)key, len, seed);
+    result = MurmurHash3_x64_128((void *)key, len, seed);
     return (PyObject *) PyLong_FromLong((long int)result);
 }
 
 static PyMethodDef murmur3_methods[] = {
-    {"murmur3", murmur3, METH_VARARGS,
-     "Make an x64 murmur3 64-bit hash value"},
-
+    {"murmur3", murmur3, METH_VARARGS, "Make an x64 murmur3 64-bit hash value"},
     {NULL, NULL, 0, NULL}
 };
 
-#if PY_MAJOR_VERSION <= 2
+#if PY_MAJOR_VERSION >= 3
 
-PyMODINIT_FUNC
-initmurmur3(void)
-{
-    (void) Py_InitModule("murmur3", murmur3_methods);
+static int murmur3_traverse(PyObject *m, visitproc visit, void *arg) {
+    Py_VISIT(GETSTATE(m)->error);
+    return 0;
 }
 
+static int murmur3_clear(PyObject *m) {
+    Py_CLEAR(GETSTATE(m)->error);
+    return 0;
+}
+
+static struct PyModuleDef moduledef = {
+        PyModuleDef_HEAD_INIT,
+        "murmur3",
+        NULL,
+        sizeof(struct module_state),
+        murmur3_methods,
+        NULL,
+        murmur3_traverse,
+        murmur3_clear,
+        NULL
+};
+
+#define INITERROR return NULL
+
+PyObject *
+PyInit_murmur3(void)
+
 #else
+#define INITERROR return
 
-/* Python 3.x */
-// TODO
-
+void
+initmurmur3(void)
 #endif
+{
+#if PY_MAJOR_VERSION >= 3
+    PyObject *module = PyModule_Create(&moduledef);
+#else
+    PyObject *module = Py_InitModule("murmur3", murmur3_methods);
+#endif
+    struct module_state *st = NULL;
+
+    if (module == NULL)
+        INITERROR;
+    st = GETSTATE(module);
+
+    st->error = PyErr_NewException("murmur3.Error", NULL, NULL);
+    if (st->error == NULL) {
+        Py_DECREF(module);
+        INITERROR;
+    }
+
+#if PY_MAJOR_VERSION >= 3
+    return module;
+#endif
+}

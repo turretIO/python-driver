@@ -1,3 +1,17 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 try:
     import unittest2 as unittest
 except ImportError:
@@ -15,6 +29,12 @@ from cassandra.pool import Host
 
 class TestStrategies(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        "Hook method for setting up class fixture before running tests in the class."
+        if not hasattr(cls, 'assertItemsEqual'):
+            cls.assertItemsEqual = cls.assertCountEqual
+
     def test_replication_strategy(self):
         """
         Basic code coverage testing that ensures different ReplicationStrategies
@@ -26,7 +46,7 @@ class TestStrategies(unittest.TestCase):
         self.assertEqual(rs.create('OldNetworkTopologyStrategy', None), None)
         self.assertEqual(rs.create('xxxxxxOldNetworkTopologyStrategy', None), None)
 
-        fake_options_map = {'options': 'map'}
+        fake_options_map = {'dc1': '3'}
         self.assertIsInstance(rs.create('NetworkTopologyStrategy', fake_options_map), NetworkTopologyStrategy)
         self.assertEqual(rs.create('NetworkTopologyStrategy', fake_options_map).dc_replication_factors,
                          NetworkTopologyStrategy(fake_options_map).dc_replication_factors)
@@ -132,6 +152,9 @@ class TestStrategies(unittest.TestCase):
         self.assertItemsEqual(rf3_replicas[MD5Token(100)], [host2, host3, host1])
         self.assertItemsEqual(rf3_replicas[MD5Token(200)], [host3, host1, host2])
 
+    def test_ss_equals(self):
+        self.assertNotEqual(SimpleStrategy(1), NetworkTopologyStrategy({'dc1': 2}))
+
 
 class TestNameEscaping(unittest.TestCase):
 
@@ -169,8 +192,8 @@ class TestNameEscaping(unittest.TestCase):
         """
         Test cassandra.metadata.protect_value output
         """
-        self.assertEqual(protect_value(True), "True")
-        self.assertEqual(protect_value(False), "False")
+        self.assertEqual(protect_value(True), "true")
+        self.assertEqual(protect_value(False), "false")
         self.assertEqual(protect_value(3.14), '3.14')
         self.assertEqual(protect_value(3), '3')
         self.assertEqual(protect_value('test'), "'test'")
@@ -200,22 +223,22 @@ class TestTokens(unittest.TestCase):
             murmur3_token = Murmur3Token(cassandra.metadata.MIN_LONG - 1)
             self.assertEqual(murmur3_token.hash_fn('123'), -7468325962851647638)
             self.assertEqual(murmur3_token.hash_fn(str(cassandra.metadata.MAX_LONG)), 7162290910810015547)
-            self.assertEqual(str(murmur3_token), '<Murmur3Token: -9223372036854775809L>')
+            self.assertEqual(str(murmur3_token), '<Murmur3Token: -9223372036854775809>')
         except NoMurmur3:
             raise unittest.SkipTest('The murmur3 extension is not available')
 
     def test_md5_tokens(self):
         md5_token = MD5Token(cassandra.metadata.MIN_LONG - 1)
-        self.assertEqual(md5_token.hash_fn('123'), 42767516990368493138776584305024125808L)
-        self.assertEqual(md5_token.hash_fn(str(cassandra.metadata.MAX_LONG)), 28528976619278518853815276204542453639L)
-        self.assertEqual(str(md5_token), '<MD5Token: -9223372036854775809L>')
+        self.assertEqual(md5_token.hash_fn('123'), 42767516990368493138776584305024125808)
+        self.assertEqual(md5_token.hash_fn(str(cassandra.metadata.MAX_LONG)), 28528976619278518853815276204542453639)
+        self.assertEqual(str(md5_token), '<MD5Token: %s>' % -9223372036854775809)
 
     def test_bytes_tokens(self):
         bytes_token = BytesToken(str(cassandra.metadata.MIN_LONG - 1))
         self.assertEqual(bytes_token.hash_fn('123'), '123')
         self.assertEqual(bytes_token.hash_fn(123), 123)
         self.assertEqual(bytes_token.hash_fn(str(cassandra.metadata.MAX_LONG)), str(cassandra.metadata.MAX_LONG))
-        self.assertEqual(str(bytes_token), "<BytesToken: '-9223372036854775809'>")
+        self.assertEqual(str(bytes_token), "<BytesToken: -9223372036854775809>")
 
         try:
             bytes_token = BytesToken(cassandra.metadata.MIN_LONG - 1)

@@ -1,9 +1,19 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from bisect import bisect_right
 from collections import defaultdict
-try:
-    from collections import OrderedDict
-except ImportError:  # Python <2.7
-    from cassandra.util import OrderedDict # NOQA
 from hashlib import md5
 from itertools import islice, cycle
 import json
@@ -11,16 +21,18 @@ import logging
 import re
 from threading import RLock
 import weakref
+import six
 
 murmur3 = None
 try:
-    from murmur3 import murmur3
-except ImportError:
+    from cassandra.murmur3 import murmur3
+except ImportError as e:
     pass
 
 import cassandra.cqltypes as types
 from cassandra.marshal import varint_unpack
 from cassandra.pool import Host
+from cassandra.util import OrderedDict
 
 log = logging.getLogger(__name__)
 
@@ -159,7 +171,7 @@ class Metadata(object):
 
         if not cf_results:
             # the table was removed
-            del keyspace_meta.tables[table]
+            keyspace_meta.tables.pop(table, None)
         else:
             assert len(cf_results) == 1
             keyspace_meta.tables[table] = self._build_table_metadata(
@@ -167,11 +179,11 @@ class Metadata(object):
 
     def _keyspace_added(self, ksname):
         if self.token_map:
-            self.token_map.rebuild_keyspace(ksname)
+            self.token_map.rebuild_keyspace(ksname, build_if_absent=False)
 
     def _keyspace_updated(self, ksname):
         if self.token_map:
-            self.token_map.rebuild_keyspace(ksname)
+            self.token_map.rebuild_keyspace(ksname, build_if_absent=False)
 
     def _keyspace_removed(self, ksname):
         if self.token_map:
@@ -286,7 +298,8 @@ class Metadata(object):
     def _build_column_metadata(self, table_metadata, row):
         name = row["column_name"]
         data_type = types.lookup_casstype(row["validator"])
-        column_meta = ColumnMetadata(table_metadata, name, data_type)
+        is_static = row.get("type", None) == "static"
+        column_meta = ColumnMetadata(table_metadata, name, data_type, is_static=is_static)
         index_meta = self._build_index_metadata(column_meta, row)
         column_meta.index = index_meta
         return column_meta
@@ -318,7 +331,7 @@ class Metadata(object):
 
         token_to_host_owner = {}
         ring = []
-        for host, token_strings in token_map.iteritems():
+        for host, token_strings in six.iteritems(token_map):
             for token_string in token_strings:
                 token = token_class(token_string)
                 ring.append(token)
@@ -347,11 +360,12 @@ class Metadata(object):
         else:
             return True
 
-    def add_host(self, address):
+    def add_host(self, address, datacenter, rack):
         cluster = self.cluster_ref()
         with self._hosts_lock:
             if address not in self._hosts:
-                new_host = Host(address, cluster.conviction_policy_factory)
+                new_host = Host(
+                    address, cluster.conviction_policy_factory, datacenter, rack)
                 self._hosts[address] = new_host
             else:
                 return None
@@ -446,7 +460,8 @@ class NetworkTopologyStrategy(ReplicationStrategy):
     """
 
     def __init__(self, dc_replication_factors):
-        self.dc_replication_factors = dc_replication_factors
+        self.dc_replication_factors = dict(
+                (str(k), int(v)) for k, v in dc_replication_factors.items())
 
     def make_token_replica_map(self, token_to_host_owner, ring):
         # note: this does not account for hosts having different racks
@@ -630,7 +645,7 @@ class TableMetadata(object):
         "compaction_strategy_class",
         "compaction_strategy_options",
         "min_compaction_threshold",
-        "max_compression_threshold",
+        "max_compaction_threshold",
         "compression_parameters",
         "min_index_interval",
         "max_index_interval",
@@ -642,6 +657,11 @@ class TableMetadata(object):
         "compaction",
         "compression",
         "default_time_to_live")
+
+    compaction_options = {
+        "min_compaction_threshold": "min_threshold",
+        "max_compaction_threshold": "max_threshold",
+        "compaction_strategy_class": "class"}
 
     def __init__(self, keyspace_metadata, name, partition_key=None, clustering_key=None, columns=None, options=None):
         self.keyspace = keyspace_metadata
@@ -687,7 +707,7 @@ class TableMetadata(object):
 
         columns = []
         for col in self.columns.values():
-            columns.append("%s %s" % (protect_name(col.name), col.typestring))
+            columns.append("%s %s%s" % (protect_name(col.name), col.typestring, ' static' if col.is_static else ''))
 
         if len(self.partition_key) == 1 and not self.clustering_key:
             columns[0] += " PRIMARY KEY"
@@ -743,30 +763,57 @@ class TableMetadata(object):
 
     def _make_option_strings(self):
         ret = []
-        for name, value in sorted(self.options.items()):
+        options_copy = dict(self.options.items())
+        if not options_copy.get('compaction'):
+            options_copy.pop('compaction', None)
+
+            actual_options = json.loads(options_copy.pop('compaction_strategy_options', '{}'))
+            for system_table_name, compact_option_name in self.compaction_options.items():
+                value = options_copy.pop(system_table_name, None)
+                if value:
+                    actual_options.setdefault(compact_option_name, value)
+
+            compaction_option_strings = ["'%s': '%s'" % (k, v) for k, v in actual_options.items()]
+            ret.append('compaction = {%s}' % ', '.join(compaction_option_strings))
+
+        for system_table_name in self.compaction_options.keys():
+            options_copy.pop(system_table_name, None)  # delete if present
+        options_copy.pop('compaction_strategy_option', None)
+
+        if not options_copy.get('compression'):
+            params = json.loads(options_copy.pop('compression_parameters', '{}'))
+            if params:
+                param_strings = ["'%s': '%s'" % (k, v) for k, v in params.items()]
+                ret.append('compression = {%s}' % ', '.join(param_strings))
+
+        for name, value in options_copy.items():
             if value is not None:
                 if name == "comment":
                     value = value or ""
                 ret.append("%s = %s" % (name, protect_value(value)))
 
-        return ret
+        return list(sorted(ret))
 
 
-def protect_name(name):
-    if isinstance(name, unicode):
-        name = name.encode('utf8')
-    return maybe_escape_name(name)
+if six.PY3:
+    def protect_name(name):
+        return maybe_escape_name(name)
+else:
+    def protect_name(name):  # NOQA
+        if isinstance(name, six.text_type):
+            name = name.encode('utf8')
+        return maybe_escape_name(name)
 
 
 def protect_names(names):
-    return map(protect_name, names)
+    return [protect_name(n) for n in names]
 
 
 def protect_value(value):
     if value is None:
         return 'NULL'
     if isinstance(value, (int, float, bool)):
-        return str(value)
+        return str(value).lower()
     return "'%s'" % value.replace("'", "''")
 
 
@@ -810,11 +857,18 @@ class ColumnMetadata(object):
     :class:`.IndexMetadata`, otherwise :const:`None`.
     """
 
-    def __init__(self, table_metadata, column_name, data_type, index_metadata=None):
+    is_static = False
+    """
+    If this column is static (available in Cassandra 2.1+), this will
+    be :const:`True`, otherwise :const:`False`.
+    """
+
+    def __init__(self, table_metadata, column_name, data_type, index_metadata=None, is_static=False):
         self.table = table_metadata
         self.name = column_name
         self.data_type = data_type
         self.index = index_metadata
+        self.is_static = is_static
 
     @property
     def typestring(self):
@@ -899,10 +953,14 @@ class TokenMap(object):
 
         self.tokens_to_hosts_by_ks = {}
         self._metadata = metadata
+        self._rebuild_lock = RLock()
 
-    def rebuild_keyspace(self, keyspace):
-        self.tokens_to_hosts_by_ks[keyspace] = \
-            self.replica_map_for_keyspace(self._metadata.keyspaces[keyspace])
+    def rebuild_keyspace(self, keyspace, build_if_absent=False):
+        with self._rebuild_lock:
+            current = self.tokens_to_hosts_by_ks.get(keyspace, None)
+            if (build_if_absent and current is None) or (not build_if_absent and current is not None):
+                replica_map = self.replica_map_for_keyspace(self._metadata.keyspaces[keyspace])
+                self.tokens_to_hosts_by_ks[keyspace] = replica_map
 
     def replica_map_for_keyspace(self, ks_metadata):
         strategy = ks_metadata.replication_strategy
@@ -912,7 +970,7 @@ class TokenMap(object):
             return None
 
     def remove_keyspace(self, keyspace):
-        del self.tokens_to_hosts_by_ks[keyspace]
+        self.tokens_to_hosts_by_ks.pop(keyspace, None)
 
     def get_replicas(self, keyspace, token):
         """
@@ -921,7 +979,7 @@ class TokenMap(object):
         """
         tokens_to_hosts = self.tokens_to_hosts_by_ks.get(keyspace, None)
         if tokens_to_hosts is None:
-            self.rebuild_keyspace(keyspace)
+            self.rebuild_keyspace(keyspace, build_if_absent=True)
             tokens_to_hosts = self.tokens_to_hosts_by_ks.get(keyspace, None)
             if tokens_to_hosts is None:
                 return []
@@ -960,11 +1018,14 @@ class Token(object):
     def __eq__(self, other):
         return self.value == other.value
 
+    def __lt__(self, other):
+        return self.value < other.value
+
     def __hash__(self):
         return hash(self.value)
 
     def __repr__(self):
-        return "<%s: %r>" % (self.__class__.__name__, self.value)
+        return "<%s: %s>" % (self.__class__.__name__, self.value)
     __str__ = __repr__
 
 MIN_LONG = -(2 ** 63)
@@ -983,7 +1044,7 @@ class Murmur3Token(Token):
     @classmethod
     def hash_fn(cls, key):
         if murmur3 is not None:
-            h = murmur3(key)
+            h = int(murmur3(key))
             return h if h != MIN_LONG else MAX_LONG
         else:
             raise NoMurmur3()
@@ -1000,6 +1061,8 @@ class MD5Token(Token):
 
     @classmethod
     def hash_fn(cls, key):
+        if isinstance(key, six.text_type):
+            key = key.encode('UTF-8')
         return abs(varint_unpack(md5(key).digest()))
 
     def __init__(self, token):
@@ -1014,7 +1077,7 @@ class BytesToken(Token):
 
     def __init__(self, token_string):
         """ `token_string` should be string representing the token. """
-        if not isinstance(token_string, basestring):
+        if not isinstance(token_string, six.string_types):
             raise TypeError(
                 "Tokens for ByteOrderedPartitioner should be strings (got %s)"
                 % (type(token_string),))

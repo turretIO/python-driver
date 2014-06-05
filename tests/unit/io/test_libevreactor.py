@@ -1,3 +1,17 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 try:
     import unittest2 as unittest
 except ImportError:
@@ -5,17 +19,19 @@ except ImportError:
 
 import errno
 import os
-from StringIO import StringIO
+
+import six
+from six import BytesIO
+
 from socket import error as socket_error
 
 from mock import patch, Mock
 
-from cassandra.connection import (PROTOCOL_VERSION,
-                                  HEADER_DIRECTION_TO_CLIENT,
+from cassandra.connection import (HEADER_DIRECTION_TO_CLIENT,
                                   ConnectionException)
 
-from cassandra.decoder import (write_stringmultimap, write_int, write_string,
-                               SupportedMessage, ReadyMessage, ServerError)
+from cassandra.protocol import (write_stringmultimap, write_int, write_string,
+                                SupportedMessage, ReadyMessage, ServerError)
 from cassandra.marshal import uint8_pack, uint32_pack, int32_pack
 
 try:
@@ -28,12 +44,13 @@ except ImportError:
 @patch('cassandra.io.libevwrapper.IO')
 @patch('cassandra.io.libevwrapper.Prepare')
 @patch('cassandra.io.libevwrapper.Async')
-@patch('cassandra.io.libevreactor._start_loop')
+@patch('cassandra.io.libevreactor.LibevLoop.maybe_start')
 class LibevConnectionTest(unittest.TestCase):
 
     def setUp(self):
         if LibevConnection is None:
             raise unittest.SkipTest('libev does not appear to be installed correctly')
+        LibevConnection.initialize_reactor()
 
     def make_connection(self):
         c = LibevConnection('1.2.3.4', cql_version='3.0.1')
@@ -41,8 +58,8 @@ class LibevConnectionTest(unittest.TestCase):
         c._socket.send.side_effect = lambda x: len(x)
         return c
 
-    def make_header_prefix(self, message_class, version=PROTOCOL_VERSION, stream_id=0):
-        return ''.join(map(uint8_pack, [
+    def make_header_prefix(self, message_class, version=2, stream_id=0):
+        return six.binary_type().join(map(uint8_pack, [
             0xff & (HEADER_DIRECTION_TO_CLIENT | version),
             0,  # flags (compression)
             stream_id,
@@ -50,7 +67,7 @@ class LibevConnectionTest(unittest.TestCase):
         ]))
 
     def make_options_body(self):
-        options_buf = StringIO()
+        options_buf = BytesIO()
         write_stringmultimap(options_buf, {
             'CQL_VERSION': ['3.0.1'],
             'COMPRESSION': []
@@ -58,12 +75,12 @@ class LibevConnectionTest(unittest.TestCase):
         return options_buf.getvalue()
 
     def make_error_body(self, code, msg):
-        buf = StringIO()
+        buf = BytesIO()
         write_int(buf, code)
         write_string(buf, msg)
         return buf.getvalue()
 
-    def make_msg(self, header, body=""):
+    def make_msg(self, header, body=six.binary_type()):
         return header + uint32_pack(len(body)) + body
 
     def test_successful_connection(self, *args):
@@ -92,12 +109,12 @@ class LibevConnectionTest(unittest.TestCase):
         # get a connection that's already fully started
         c = self.test_successful_connection()
 
-        header = '\x00\x00\x00\x00' + int32_pack(20000)
+        header = six.b('\x00\x00\x00\x00') + int32_pack(20000)
         responses = [
-            header + ('a' * (4096 - len(header))),
-            'a' * 4096,
+            header + (six.b('a') * (4096 - len(header))),
+            six.b('a') * 4096,
             socket_error(errno.EAGAIN),
-            'a' * 100,
+            six.b('a') * 100,
             socket_error(errno.EAGAIN)]
 
         def side_effect(*args):
@@ -109,17 +126,17 @@ class LibevConnectionTest(unittest.TestCase):
 
         c._socket.recv.side_effect = side_effect
         c.handle_read(None, 0)
-        self.assertEquals(c._total_reqd_bytes, 20000 + len(header))
+        self.assertEqual(c._total_reqd_bytes, 20000 + len(header))
         # the EAGAIN prevents it from reading the last 100 bytes
         c._iobuf.seek(0, os.SEEK_END)
         pos = c._iobuf.tell()
-        self.assertEquals(pos, 4096 + 4096)
+        self.assertEqual(pos, 4096 + 4096)
 
         # now tell it to read the last 100 bytes
         c.handle_read(None, 0)
         c._iobuf.seek(0, os.SEEK_END)
         pos = c._iobuf.tell()
-        self.assertEquals(pos, 4096 + 4096 + 100)
+        self.assertEqual(pos, 4096 + 4096 + 100)
 
     def test_protocol_error(self, *args):
         c = self.make_connection()
@@ -225,13 +242,13 @@ class LibevConnectionTest(unittest.TestCase):
         message = self.make_msg(header, options)
 
         # read in the first byte
-        c._socket.recv.return_value = message[0]
+        c._socket.recv.return_value = message[0:1]
         c.handle_read(None, 0)
-        self.assertEquals(c._iobuf.getvalue(), message[0])
+        self.assertEqual(c._iobuf.getvalue(), message[0:1])
 
         c._socket.recv.return_value = message[1:]
         c.handle_read(None, 0)
-        self.assertEquals("", c._iobuf.getvalue())
+        self.assertEqual(six.binary_type(), c._iobuf.getvalue())
 
         # let it write out a StartupMessage
         c.handle_write(None, 0)
@@ -253,12 +270,12 @@ class LibevConnectionTest(unittest.TestCase):
         # read in the first nine bytes
         c._socket.recv.return_value = message[:9]
         c.handle_read(None, 0)
-        self.assertEquals(c._iobuf.getvalue(), message[:9])
+        self.assertEqual(c._iobuf.getvalue(), message[:9])
 
         # ... then read in the rest
         c._socket.recv.return_value = message[9:]
         c.handle_read(None, 0)
-        self.assertEquals("", c._iobuf.getvalue())
+        self.assertEqual(six.binary_type(), c._iobuf.getvalue())
 
         # let it write out a StartupMessage
         c.handle_write(None, 0)

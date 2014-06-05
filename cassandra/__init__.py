@@ -1,3 +1,17 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 
 
@@ -9,7 +23,7 @@ class NullHandler(logging.Handler):
 logging.getLogger('cassandra').addHandler(NullHandler())
 
 
-__version_info__ = (1, 0, 1, 'post')
+__version_info__ = (2, 0, 1, 'post')
 __version__ = '.'.join(map(str, __version_info__))
 
 
@@ -60,6 +74,19 @@ class ConsistencyLevel(object):
     Requires a quorum of replicas in each datacenter
     """
 
+    SERIAL = 8
+    """
+    For conditional inserts/updates that utilize Cassandra's lightweight
+    transactions, this requires consensus among all replicas for the
+    modified data.
+    """
+
+    LOCAL_SERIAL = 9
+    """
+    Like :attr:`~ConsistencyLevel.SERIAL`, but only requires consensus
+    among replicas in the local datacenter.
+    """
+
     LOCAL_ONE = 10
     """
     Sends a request only to replicas in the local datacenter and waits for
@@ -75,6 +102,8 @@ ConsistencyLevel.value_to_name = {
     ConsistencyLevel.ALL: 'ALL',
     ConsistencyLevel.LOCAL_QUORUM: 'LOCAL_QUORUM',
     ConsistencyLevel.EACH_QUORUM: 'EACH_QUORUM',
+    ConsistencyLevel.SERIAL: 'SERIAL',
+    ConsistencyLevel.LOCAL_SERIAL: 'LOCAL_SERIAL',
     ConsistencyLevel.LOCAL_ONE: 'LOCAL_ONE'
 }
 
@@ -87,6 +116,8 @@ ConsistencyLevel.name_to_value = {
     'ALL': ConsistencyLevel.ALL,
     'LOCAL_QUORUM': ConsistencyLevel.LOCAL_QUORUM,
     'EACH_QUORUM': ConsistencyLevel.EACH_QUORUM,
+    'SERIAL': ConsistencyLevel.SERIAL,
+    'LOCAL_SERIAL': ConsistencyLevel.LOCAL_SERIAL,
     'LOCAL_ONE': ConsistencyLevel.LOCAL_ONE
 }
 
@@ -242,3 +273,12 @@ class OperationTimedOut(Exception):
         self.last_host = last_host
         message = "errors=%s, last_host=%s" % (self.errors, self.last_host)
         Exception.__init__(self, message)
+
+
+class UnsupportedOperation(Exception):
+    """
+    An attempt was made to use a feature that is not supported by the
+    selected protocol version.  See :attr:`Cluster.protocol_version`
+    for more details.
+    """
+    pass

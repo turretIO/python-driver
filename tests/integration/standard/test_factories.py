@@ -1,15 +1,27 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from tests.integration import PROTOCOL_VERSION
+
 try:
     import unittest2 as unittest
 except ImportError:
     import unittest # noqa
 
 from cassandra.cluster import Cluster
-from cassandra.decoder import tuple_factory, named_tuple_factory, dict_factory, ordered_dict_factory
-
-try:
-    from collections import OrderedDict
-except ImportError:  # Python <2.7
-    from cassandra.util import OrderedDict # NOQA
+from cassandra.query import tuple_factory, named_tuple_factory, dict_factory, ordered_dict_factory
+from cassandra.util import OrderedDict
 
 
 class TestFactories(unittest.TestCase):
@@ -40,7 +52,7 @@ class TestFactories(unittest.TestCase):
     '''
 
     def test_tuple_factory(self):
-        cluster = Cluster()
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         session = cluster.connect()
         session.row_factory = tuple_factory
 
@@ -62,7 +74,7 @@ class TestFactories(unittest.TestCase):
         self.assertEqual(result[1][0], 2)
 
     def test_named_tuple_factoryy(self):
-        cluster = Cluster()
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         session = cluster.connect()
         session.row_factory = named_tuple_factory
 
@@ -83,7 +95,7 @@ class TestFactories(unittest.TestCase):
         self.assertEqual(result[1].k, 2)
 
     def test_dict_factory(self):
-        cluster = Cluster()
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         session = cluster.connect()
         session.row_factory = dict_factory
 
@@ -105,7 +117,7 @@ class TestFactories(unittest.TestCase):
         self.assertEqual(result[1]['k'], 2)
 
     def test_ordered_dict_factory(self):
-        cluster = Cluster()
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         session = cluster.connect()
         session.row_factory = ordered_dict_factory
 

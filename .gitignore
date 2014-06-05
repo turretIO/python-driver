@@ -2,6 +2,7 @@
 *.swp
 *.swo
 *.so
+*.egg
 *.egg-info
 .tox
 .idea/
@@ -15,3 +16,4 @@ cover/
 docs/_build/
 tests/integration/ccm
 setuptools*.tar.gz
+setuptools*.egg

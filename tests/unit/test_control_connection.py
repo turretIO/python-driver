@@ -1,3 +1,17 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 try:
     import unittest2 as unittest
 except ImportError:
@@ -8,13 +22,14 @@ from mock import Mock, ANY
 from concurrent.futures import ThreadPoolExecutor
 
 from cassandra import OperationTimedOut
-from cassandra.decoder import ResultMessage
+from cassandra.protocol import ResultMessage, RESULT_KIND_ROWS
 from cassandra.cluster import ControlConnection, Cluster, _Scheduler
 from cassandra.pool import Host
 from cassandra.policies import (SimpleConvictionPolicy, RoundRobinPolicy,
                                 ConstantReconnectionPolicy)
 
 PEER_IP = "foobar"
+
 
 class MockMetadata(object):
 
@@ -49,6 +64,7 @@ class MockCluster(object):
     reconnection_policy = ConstantReconnectionPolicy(2)
     down_host = None
     contact_points = []
+    is_shutdown = False
 
     def __init__(self):
         self.metadata = MockMetadata()
@@ -57,8 +73,8 @@ class MockCluster(object):
         self.scheduler = Mock(spec=_Scheduler)
         self.executor = Mock(spec=ThreadPoolExecutor)
 
-    def add_host(self, address, signal=False):
-        host = Host(address, SimpleConvictionPolicy)
+    def add_host(self, address, datacenter, rack, signal=False):
+        host = Host(address, SimpleConvictionPolicy, datacenter, rack)
         self.added_hosts.append(host)
         return host
 
@@ -88,13 +104,12 @@ class MockConnection(object):
             [["192.168.1.1", "10.0.0.1", "a", "dc1", "rack1", ["1", "101", "201"]],
              ["192.168.1.2", "10.0.0.2", "a", "dc1", "rack1", ["2", "102", "202"]]]
         ]
-
-    def wait_for_responses(self, peer_query, local_query, timeout=None):
         local_response = ResultMessage(
-            kind=ResultMessage.KIND_ROWS, results=self.local_results)
+            kind=RESULT_KIND_ROWS, results=self.local_results)
         peer_response = ResultMessage(
-            kind=ResultMessage.KIND_ROWS, results=self.peer_results)
-        return (peer_response, local_response)
+            kind=RESULT_KIND_ROWS, results=self.peer_results)
+
+        self.wait_for_responses = Mock(return_value=(peer_response, local_response))
 
 
 class FakeTime(object):
@@ -120,6 +135,38 @@ class ControlConnectionTest(unittest.TestCase):
         self.control_connection._connection = self.connection
         self.control_connection._time = self.time
 
+    def _get_matching_schema_preloaded_results(self):
+        local_results = [
+            ["schema_version", "cluster_name", "data_center", "rack", "partitioner", "tokens"],
+            [["a", "foocluster", "dc1", "rack1", "Murmur3Partitioner", ["0", "100", "200"]]]
+        ]
+        local_response = ResultMessage(kind=RESULT_KIND_ROWS, results=local_results)
+
+        peer_results = [
+            ["rpc_address", "peer", "schema_version", "data_center", "rack", "tokens"],
+            [["192.168.1.1", "10.0.0.1", "a", "dc1", "rack1", ["1", "101", "201"]],
+             ["192.168.1.2", "10.0.0.2", "a", "dc1", "rack1", ["2", "102", "202"]]]
+        ]
+        peer_response = ResultMessage(kind=RESULT_KIND_ROWS, results=peer_results)
+
+        return (peer_response, local_response)
+
+    def _get_nonmatching_schema_preloaded_results(self):
+        local_results = [
+            ["schema_version", "cluster_name", "data_center", "rack", "partitioner", "tokens"],
+            [["a", "foocluster", "dc1", "rack1", "Murmur3Partitioner", ["0", "100", "200"]]]
+        ]
+        local_response = ResultMessage(kind=RESULT_KIND_ROWS, results=local_results)
+
+        peer_results = [
+            ["rpc_address", "peer", "schema_version", "data_center", "rack", "tokens"],
+            [["192.168.1.1", "10.0.0.1", "a", "dc1", "rack1", ["1", "101", "201"]],
+             ["192.168.1.2", "10.0.0.2", "b", "dc1", "rack1", ["2", "102", "202"]]]
+        ]
+        peer_response = ResultMessage(kind=RESULT_KIND_ROWS, results=peer_results)
+
+        return (peer_response, local_response)
+
     def test_wait_for_schema_agreement(self):
         """
         Basic test with all schema versions agreeing
@@ -127,6 +174,29 @@ class ControlConnectionTest(unittest.TestCase):
         self.assertTrue(self.control_connection.wait_for_schema_agreement())
         # the control connection should not have slept at all
         self.assertEqual(self.time.clock, 0)
+
+    def test_wait_for_schema_agreement_uses_preloaded_results_if_given(self):
+        """
+        wait_for_schema_agreement uses preloaded results if given for shared table queries
+        """
+        preloaded_results = self._get_matching_schema_preloaded_results()
+
+        self.assertTrue(self.control_connection.wait_for_schema_agreement(preloaded_results=preloaded_results))
+        # the control connection should not have slept at all
+        self.assertEqual(self.time.clock, 0)
+        # the connection should not have made any queries if given preloaded results
+        self.assertEqual(self.connection.wait_for_responses.call_count, 0)
+
+    def test_wait_for_schema_agreement_falls_back_to_querying_if_schemas_dont_match_preloaded_result(self):
+        """
+        wait_for_schema_agreement requery if schema does not match using preloaded results
+        """
+        preloaded_results = self._get_nonmatching_schema_preloaded_results()
+
+        self.assertTrue(self.control_connection.wait_for_schema_agreement(preloaded_results=preloaded_results))
+        # the control connection should not have slept at all
+        self.assertEqual(self.time.clock, 0)
+        self.assertEqual(self.connection.wait_for_responses.call_count, 1)
 
     def test_wait_for_schema_agreement_fails(self):
         """
@@ -195,6 +265,32 @@ class ControlConnectionTest(unittest.TestCase):
             self.assertEqual(host.datacenter, "dc1")
             self.assertEqual(host.rack, "rack1")
 
+        self.assertEqual(self.connection.wait_for_responses.call_count, 1)
+
+    def test_refresh_nodes_and_tokens_uses_preloaded_results_if_given(self):
+        """
+        refresh_nodes_and_tokens uses preloaded results if given for shared table queries
+        """
+        preloaded_results = self._get_matching_schema_preloaded_results()
+
+        self.control_connection._refresh_node_list_and_token_map(self.connection, preloaded_results=preloaded_results)
+        meta = self.cluster.metadata
+        self.assertEqual(meta.partitioner, 'Murmur3Partitioner')
+        self.assertEqual(meta.cluster_name, 'foocluster')
+
+        # check token map
+        self.assertEqual(sorted(meta.all_hosts()), sorted(meta.token_map.keys()))
+        for token_list in meta.token_map.values():
+            self.assertEqual(3, len(token_list))
+
+        # check datacenter/rack
+        for host in meta.all_hosts():
+            self.assertEqual(host.datacenter, "dc1")
+            self.assertEqual(host.rack, "rack1")
+
+        # the connection should not have made any queries if given preloaded results
+        self.assertEqual(self.connection.wait_for_responses.call_count, 0)
+
     def test_refresh_nodes_and_tokens_no_partitioner(self):
         """
         Test handling of an unknown partitioner.
@@ -210,6 +306,7 @@ class ControlConnectionTest(unittest.TestCase):
         self.connection.peer_results[1].append(
             ["192.168.1.3", "10.0.0.3", "a", "dc1", "rack1", ["3", "103", "203"]]
         )
+        self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
         self.control_connection.refresh_node_list_and_token_map()
         self.assertEqual(1, len(self.cluster.added_hosts))
         self.assertEqual(self.cluster.added_hosts[0].address, "192.168.1.3")
@@ -248,7 +345,7 @@ class ControlConnectionTest(unittest.TestCase):
             'address': ('1.2.3.4', 9000)
         }
         self.control_connection._handle_topology_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.cluster.add_host, '1.2.3.4', signal=True)
+        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
         event = {
             'change_type': 'REMOVED_NODE',
@@ -270,7 +367,7 @@ class ControlConnectionTest(unittest.TestCase):
             'address': ('1.2.3.4', 9000)
         }
         self.control_connection._handle_status_change(event)
-        self.cluster.scheduler.schedule.assert_called_with(ANY, self.cluster.add_host, '1.2.3.4', signal=True)
+        self.cluster.scheduler.schedule.assert_called_with(ANY, self.control_connection.refresh_node_list_and_token_map)
 
         # do the same with a known Host
         event = {

@@ -1,32 +1,50 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import defaultdict
 import errno
 from functools import wraps, partial
 import logging
+import sys
 from threading import Event, RLock
-from Queue import Queue
+import time
+
+if 'gevent.monkey' in sys.modules:
+    from gevent.queue import Queue, Empty
+else:
+    from six.moves.queue import Queue, Empty  # noqa
+
+import six
+from six.moves import range
 
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut
-from cassandra.marshal import int8_unpack, int32_pack
-from cassandra.decoder import (ReadyMessage, AuthenticateMessage, OptionsMessage,
-                               StartupMessage, ErrorMessage, CredentialsMessage,
-                               QueryMessage, ResultMessage, decode_response,
-                               InvalidRequestException, SupportedMessage)
+from cassandra.marshal import int32_pack, header_unpack
+from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessage,
+                                StartupMessage, ErrorMessage, CredentialsMessage,
+                                QueryMessage, ResultMessage, decode_response,
+                                InvalidRequestException, SupportedMessage,
+                                AuthResponseMessage, AuthChallengeMessage,
+                                AuthSuccessMessage)
+from cassandra.util import OrderedDict
 
 
 log = logging.getLogger(__name__)
 
-locally_supported_compressions = {}
-
-try:
-    import snappy
-except ImportError:
-    pass
-else:
-    # work around apparently buggy snappy decompress
-    def decompress(byts):
-        if byts == '\x00':
-            return ''
-        return snappy.decompress(byts)
-    locally_supported_compressions['snappy'] = (snappy.compress, decompress)
+# We use an ordered dictionary and specifically add lz4 before
+# snappy so that lz4 will be preferred. Changing the order of this
+# will change the compression preferences for the driver.
+locally_supported_compressions = OrderedDict()
 
 try:
     import lz4
@@ -48,10 +66,21 @@ else:
 
     locally_supported_compressions['lz4'] = (lz4_compress, lz4_decompress)
 
+try:
+    import snappy
+except ImportError:
+    pass
+else:
+    # work around apparently buggy snappy decompress
+    def decompress(byts):
+        if byts == '\x00':
+            return ''
+        return snappy.decompress(byts)
+    locally_supported_compressions['snappy'] = (snappy.compress, decompress)
+
 
 MAX_STREAM_PER_CONNECTION = 127
 
-PROTOCOL_VERSION = 0x01
 PROTOCOL_VERSION_MASK = 0x7f
 
 HEADER_DIRECTION_FROM_CLIENT = 0x00
@@ -102,7 +131,6 @@ def defunct_on_error(f):
             return f(self, *args, **kwargs)
         except Exception as exc:
             self.defunct(exc)
-
     return wrapper
 
 
@@ -115,6 +143,7 @@ class Connection(object):
     out_buffer_size = 4096
 
     cql_version = None
+    protocol_version = 2
 
     keyspace = None
     compression = True
@@ -128,16 +157,21 @@ class Connection(object):
     is_closed = False
     lock = None
 
-    def __init__(self, host='127.0.0.1', port=9042, credentials=None,
+    is_control_connection = False
+
+    def __init__(self, host='127.0.0.1', port=9042, authenticator=None,
                  ssl_options=None, sockopts=None, compression=True,
-                 cql_version=None):
+                 cql_version=None, protocol_version=2, is_control_connection=False):
         self.host = host
         self.port = port
-        self.credentials = credentials
+        self.authenticator = authenticator
         self.ssl_options = ssl_options
         self.sockopts = sockopts
         self.compression = compression
         self.cql_version = cql_version
+        self.protocol_version = protocol_version
+        self.is_control_connection = is_control_connection
+        self._push_watchers = defaultdict(set)
 
         self._id_queue = Queue(MAX_STREAM_PER_CONNECTION)
         for i in range(MAX_STREAM_PER_CONNECTION):
@@ -145,20 +179,109 @@ class Connection(object):
 
         self.lock = RLock()
 
+    @classmethod
+    def initialize_reactor(self):
+        """
+        Called once by Cluster.connect().  This should be used by implementations
+        to set up any resources that will be shared across connections.
+        """
+        pass
+
     def close(self):
         raise NotImplementedError()
 
     def defunct(self, exc):
-        raise NotImplementedError()
+        with self.lock:
+            if self.is_defunct or self.is_closed:
+                return
+            self.is_defunct = True
 
-    def send_msg(self, msg, cb):
-        raise NotImplementedError()
+        log.debug("Defuncting connection (%s) to %s:",
+                  id(self), self.host, exc_info=exc)
 
-    def wait_for_response(self, msg, **kwargs):
-        raise NotImplementedError()
+        self.last_error = exc
+        self.close()
+        self.error_all_callbacks(exc)
+        self.connected_event.set()
+        return exc
+
+    def error_all_callbacks(self, exc):
+        with self.lock:
+            callbacks = self._callbacks
+            self._callbacks = {}
+        new_exc = ConnectionShutdown(str(exc))
+        for cb in callbacks.values():
+            try:
+                cb(new_exc)
+            except Exception:
+                log.warning("Ignoring unhandled exception while erroring callbacks for a "
+                            "failed connection (%s) to host %s:",
+                            id(self), self.host, exc_info=True)
+
+    def handle_pushed(self, response):
+        log.debug("Message pushed from server: %r", response)
+        for cb in self._push_watchers.get(response.event_type, []):
+            try:
+                cb(response.event_args)
+            except Exception:
+                log.exception("Pushed event handler errored, ignoring:")
+
+    def send_msg(self, msg, cb, wait_for_id=False):
+        if self.is_defunct:
+            raise ConnectionShutdown("Connection to %s is defunct" % self.host)
+        elif self.is_closed:
+            raise ConnectionShutdown("Connection to %s is closed" % self.host)
+
+        if not wait_for_id:
+            try:
+                request_id = self._id_queue.get_nowait()
+            except Empty:
+                raise ConnectionBusy(
+                    "Connection to %s is at the max number of requests" % self.host)
+        else:
+            request_id = self._id_queue.get()
+
+        self._callbacks[request_id] = cb
+        self.push(msg.to_binary(request_id, self.protocol_version, compression=self.compressor))
+        return request_id
+
+    def wait_for_response(self, msg, timeout=None):
+        return self.wait_for_responses(msg, timeout=timeout)[0]
 
     def wait_for_responses(self, *msgs, **kwargs):
-        raise NotImplementedError()
+        if self.is_closed or self.is_defunct:
+            raise ConnectionShutdown("Connection %s is already closed" % (self, ))
+        timeout = kwargs.get('timeout')
+        waiter = ResponseWaiter(self, len(msgs))
+
+        # busy wait for sufficient space on the connection
+        messages_sent = 0
+        while True:
+            needed = len(msgs) - messages_sent
+            with self.lock:
+                available = min(needed, MAX_STREAM_PER_CONNECTION - self.in_flight)
+                self.in_flight += available
+
+            for i in range(messages_sent, messages_sent + available):
+                self.send_msg(msgs[i], partial(waiter.got_response, index=i), wait_for_id=True)
+            messages_sent += available
+
+            if messages_sent == len(msgs):
+                break
+            else:
+                if timeout is not None:
+                    timeout -= 0.01
+                    if timeout <= 0.0:
+                        raise OperationTimedOut()
+                time.sleep(0.01)
+
+        try:
+            return waiter.deliver(timeout)
+        except OperationTimedOut:
+            raise
+        except Exception as exc:
+            self.defunct(exc)
+            raise
 
     def register_watcher(self, event_type, callback):
         raise NotImplementedError()
@@ -166,9 +289,13 @@ class Connection(object):
     def register_watchers(self, type_callback_dict):
         raise NotImplementedError()
 
+    def control_conn_disposed(self):
+        self.is_control_connection = False
+        self._push_watchers = {}
+
     @defunct_on_error
     def process_msg(self, msg, body_len):
-        version, flags, stream_id, opcode = map(int8_unpack, msg[:4])
+        version, flags, stream_id, opcode = header_unpack(msg[:4])
         if stream_id < 0:
             callback = None
         else:
@@ -179,8 +306,10 @@ class Connection(object):
         try:
             # check that the protocol version is supported
             given_version = version & PROTOCOL_VERSION_MASK
-            if given_version != PROTOCOL_VERSION:
-                raise ProtocolError("Unsupported CQL protocol version: %d" % given_version)
+            if given_version != self.protocol_version:
+                msg = "Server protocol version (%d) does not match the specified driver protocol version (%d). " +\
+                      "Consider setting Cluster.protocol_version to %d."
+                raise ProtocolError(msg % (given_version, self.protocol_version, given_version))
 
             # check that the header direction is correct
             if version & HEADER_DIRECTION_MASK != HEADER_DIRECTION_TO_CLIENT:
@@ -191,14 +320,14 @@ class Connection(object):
             if body_len > 0:
                 body = msg[8:]
             elif body_len == 0:
-                body = ""
+                body = six.binary_type()
             else:
                 raise ProtocolError("Got negative body length: %r" % body_len)
 
             response = decode_response(stream_id, flags, opcode, body, self.decompressor)
         except Exception as exc:
             log.exception("Error decoding response from Cassandra. "
-                          "opcode: %04x; message contents: %r", opcode, body)
+                          "opcode: %04x; message contents: %r", opcode, msg)
             if callback is not None:
                 callback(exc)
             self.defunct(exc)
@@ -265,7 +394,22 @@ class Connection(object):
                           locally_supported_compressions.keys(),
                           remote_supported_compressions)
             else:
-                compression_type = iter(overlap).next()  # choose any
+                compression_type = None
+                if isinstance(self.compression, six.string_types):
+                    # the user picked a specific compression type ('snappy' or 'lz4')
+                    if self.compression not in remote_supported_compressions:
+                        raise ProtocolError(
+                            "The requested compression type (%s) is not supported by the Cassandra server at %s"
+                            % (self.compression, self.host))
+                    compression_type = self.compression
+                else:
+                    # our locally supported compressions are ordered to prefer
+                    # lz4, if available
+                    for k in locally_supported_compressions.keys():
+                        if k in overlap:
+                            compression_type = k
+                            break
+
                 # set the decompressor here, but set the compressor only after
                 # a successful Ready message
                 self._compressor, self.decompressor = \
@@ -291,15 +435,24 @@ class Connection(object):
                 self.compressor = self._compressor
             self.connected_event.set()
         elif isinstance(startup_response, AuthenticateMessage):
-            log.debug("Got AuthenticateMessage on new connection (%s) from %s", id(self), self.host)
+            log.debug("Got AuthenticateMessage on new connection (%s) from %s: %s",
+                      id(self), self.host, startup_response.authenticator)
 
-            if self.credentials is None:
+            if self.authenticator is None:
                 raise AuthenticationFailed('Remote end requires authentication.')
 
-            self.authenticator = startup_response.authenticator
-            cm = CredentialsMessage(creds=self.credentials)
-            callback = partial(self._handle_startup_response, did_authenticate=True)
-            self.send_msg(cm, cb=callback)
+            self.authenticator_class = startup_response.authenticator
+
+            if isinstance(self.authenticator, dict):
+                log.debug("Sending credentials-based auth response on %s", self)
+                cm = CredentialsMessage(creds=self.authenticator)
+                callback = partial(self._handle_startup_response, did_authenticate=True)
+                self.send_msg(cm, cb=callback)
+            else:
+                log.debug("Sending SASL-based auth response on %s", self)
+                initial_response = self.authenticator.initial_response()
+                initial_response = "" if initial_response is None else initial_response.encode('utf-8')
+                self.send_msg(AuthResponseMessage(initial_response), self._handle_auth_response)
         elif isinstance(startup_response, ErrorMessage):
             log.debug("Received ErrorMessage on new connection (%s) from %s: %s",
                       id(self), self.host, startup_response.summary_msg())
@@ -311,10 +464,43 @@ class Connection(object):
                 raise ConnectionException(
                     "Failed to initialize new connection to %s: %s"
                     % (self.host, startup_response.summary_msg()))
+        elif isinstance(startup_response, ConnectionShutdown):
+            log.debug("Connection to %s was closed during the startup handshake", (self.host))
+            raise startup_response
         else:
             msg = "Unexpected response during Connection setup: %r"
             log.error(msg, startup_response)
             raise ProtocolError(msg % (startup_response,))
+
+    @defunct_on_error
+    def _handle_auth_response(self, auth_response):
+        if self.is_defunct:
+            return
+
+        if isinstance(auth_response, AuthSuccessMessage):
+            log.debug("Connection %s successfully authenticated", self)
+            self.authenticator.on_authentication_success(auth_response.token)
+            if self._compressor:
+                self.compressor = self._compressor
+            self.connected_event.set()
+        elif isinstance(auth_response, AuthChallengeMessage):
+            response = self.authenticator.evaluate_challenge(auth_response.challenge)
+            msg = AuthResponseMessage("" if response is None else response)
+            log.debug("Responding to auth challenge on %s", self)
+            self.send_msg(msg, self._handle_auth_response)
+        elif isinstance(auth_response, ErrorMessage):
+            log.debug("Received ErrorMessage on new connection (%s) from %s: %s",
+                      id(self), self.host, auth_response.summary_msg())
+            raise AuthenticationFailed(
+                "Failed to authenticate to %s: %s" %
+                (self.host, auth_response.summary_msg()))
+        elif isinstance(auth_response, ConnectionShutdown):
+            log.debug("Connection to %s was closed during the authentication process", self.host)
+            raise auth_response
+        else:
+            msg = "Unexpected response during Connection authentication to %s: %r"
+            log.error(msg, self.host, auth_response)
+            raise ProtocolError(msg % (self.host, auth_response))
 
     def set_keyspace_blocking(self, keyspace):
         if not keyspace or keyspace == self.keyspace:

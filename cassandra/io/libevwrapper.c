@@ -8,7 +8,7 @@ typedef struct libevwrapper_Loop {
 
 static void
 Loop_dealloc(libevwrapper_Loop *self) {
-    self->ob_type->tp_free((PyObject *)self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
 };
 
 static PyObject*
@@ -17,11 +17,6 @@ Loop_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
 
     self = (libevwrapper_Loop *)type->tp_alloc(type, 0);
     if (self != NULL) {
-        // select is the most portable backend, it is generally the most
-        // efficient for the number of file descriptors we'll be working with,
-        // and the epoll backend seems to occasionally leave write requests
-        // hanging (although I'm not sure if that's due to a misuse of libev
-        // or not)
         self->loop = ev_default_loop(EVBACKEND_SELECT);
         if (!self->loop) {
             PyErr_SetString(PyExc_Exception, "Error getting default ev loop");
@@ -61,9 +56,9 @@ static PyMethodDef Loop_methods[] = {
     {NULL} /* Sentinel */
 };
 
-static PyTypeObject libevwrapper_LoopType = {
-    PyObject_HEAD_INIT(NULL)
-    0,                               /*ob_size*/
+static
+PyTypeObject libevwrapper_LoopType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
     "cassandra.io.libevwrapper.Loop",/*tp_name*/
     sizeof(libevwrapper_Loop),       /*tp_basicsize*/
     0,                               /*tp_itemsize*/
@@ -114,7 +109,7 @@ static void
 IO_dealloc(libevwrapper_IO *self) {
     Py_XDECREF(self->loop);
     Py_XDECREF(self->callback);
-    self->ob_type->tp_free((PyObject *)self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
 };
 
 static void io_callback(struct ev_loop *loop, ev_io *watcher, int revents) {
@@ -138,7 +133,8 @@ IO_init(libevwrapper_IO *self, PyObject *args, PyObject *kwds) {
     PyObject *socket;
     PyObject *callback;
     PyObject *loop;
-    int io_flags = 0;
+    int io_flags = 0, fd = -1;
+    struct ev_io *io = NULL;
 
     if (!PyArg_ParseTuple(args, "OiOO", &socket, &io_flags, &loop, &callback)) {
         return -1;
@@ -159,14 +155,15 @@ IO_init(libevwrapper_IO *self, PyObject *args, PyObject *kwds) {
         self->callback = callback;
     }
 
-    int fd = PyObject_AsFileDescriptor(socket);
+    fd = PyObject_AsFileDescriptor(socket);
     if (fd == -1) {
         PyErr_SetString(PyExc_TypeError, "unable to get file descriptor from socket");
         Py_XDECREF(callback);
         Py_XDECREF(loop);
         return -1;
     }
-    ev_io_init(&self->io, io_callback, fd, io_flags);
+    io = &(self->io);
+    ev_io_init(io, io_callback, fd, io_flags);
     self->io.data = self;
     return 0;
 }
@@ -185,12 +182,14 @@ IO_stop(libevwrapper_IO *self, PyObject *args) {
 
 static PyObject*
 IO_is_active(libevwrapper_IO *self, PyObject *args) {
-    return PyBool_FromLong(ev_is_active(&self->io));
+    struct ev_io *io = &(self->io);
+    return PyBool_FromLong(ev_is_active(io));
 }
 
 static PyObject*
 IO_is_pending(libevwrapper_IO *self, PyObject *args) {
-    return PyBool_FromLong(ev_is_pending(&self->io));
+    struct ev_io *io = &(self->io);
+    return PyBool_FromLong(ev_is_pending(io));
 }
 
 static PyMethodDef IO_methods[] = {
@@ -202,8 +201,7 @@ static PyMethodDef IO_methods[] = {
 };
 
 static PyTypeObject libevwrapper_IOType = {
-    PyObject_HEAD_INIT(NULL)
-    0,                               /*ob_size*/
+    PyVarObject_HEAD_INIT(NULL, 0)
     "cassandra.io.libevwrapper.IO",  /*tp_name*/
     sizeof(libevwrapper_IO),         /*tp_basicsize*/
     0,                               /*tp_itemsize*/
@@ -249,7 +247,8 @@ typedef struct libevwrapper_Async {
 
 static void
 Async_dealloc(libevwrapper_Async *self) {
-    self->ob_type->tp_free((PyObject *)self);
+    Py_XDECREF(self->loop);
+    Py_TYPE(self)->tp_free((PyObject *)self);
 };
 
 static void async_callback(EV_P_ ev_async *watcher, int revents) {};
@@ -257,8 +256,9 @@ static void async_callback(EV_P_ ev_async *watcher, int revents) {};
 static int
 Async_init(libevwrapper_Async *self, PyObject *args, PyObject *kwds) {
     PyObject *loop;
-
     static char *kwlist[] = {"loop", NULL};
+    struct ev_async *async = NULL;
+
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &loop)) {
         PyErr_SetString(PyExc_TypeError, "unable to get file descriptor from socket");
         return -1;
@@ -270,7 +270,8 @@ Async_init(libevwrapper_Async *self, PyObject *args, PyObject *kwds) {
     } else {
         return -1;
     }
-    ev_async_init(&self->async, async_callback);
+    async = &(self->async);
+    ev_async_init(async, async_callback);
     return 0;
 };
 
@@ -293,8 +294,7 @@ static PyMethodDef Async_methods[] = {
 };
 
 static PyTypeObject libevwrapper_AsyncType = {
-    PyObject_HEAD_INIT(NULL)
-    0,                               /*ob_size*/
+    PyVarObject_HEAD_INIT(NULL, 0)
     "cassandra.io.libevwrapper.Async", /*tp_name*/
     sizeof(libevwrapper_Async),      /*tp_basicsize*/
     0,                               /*tp_itemsize*/
@@ -343,16 +343,16 @@ static void
 Prepare_dealloc(libevwrapper_Prepare *self) {
     Py_XDECREF(self->loop);
     Py_XDECREF(self->callback);
-    self->ob_type->tp_free((PyObject *)self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 static void prepare_callback(struct ev_loop *loop, ev_prepare *watcher, int revents) {
     libevwrapper_Prepare *self = watcher->data;
-
+    PyObject *result = NULL;
     PyGILState_STATE gstate;
-    gstate = PyGILState_Ensure();
 
-    PyObject *result = PyObject_CallFunction(self->callback, "O", self);
+    gstate = PyGILState_Ensure();
+    result = PyObject_CallFunction(self->callback, "O", self);
     if (!result) {
         PyErr_WriteUnraisable(self->callback);
     }
@@ -365,6 +365,7 @@ static int
 Prepare_init(libevwrapper_Prepare *self, PyObject *args, PyObject *kwds) {
     PyObject *callback;
     PyObject *loop;
+    struct ev_prepare *prepare = NULL;
 
     if (!PyArg_ParseTuple(args, "OO", &loop, &callback)) {
         return -1;
@@ -386,7 +387,8 @@ Prepare_init(libevwrapper_Prepare *self, PyObject *args, PyObject *kwds) {
         Py_INCREF(callback);
         self->callback = callback;
     }
-    ev_prepare_init(&self->prepare, prepare_callback);
+    prepare = &(self->prepare);
+    ev_prepare_init(prepare, prepare_callback);
     self->prepare.data = self;
     return 0;
 }
@@ -410,8 +412,7 @@ static PyMethodDef Prepare_methods[] = {
 };
 
 static PyTypeObject libevwrapper_PrepareType = {
-    PyObject_HEAD_INIT(NULL)
-    0,                               /*ob_size*/
+    PyVarObject_HEAD_INIT(NULL, 0)
     "cassandra.io.libevwrapper.Prepare",  /*tp_name*/
     sizeof(libevwrapper_Prepare),    /*tp_basicsize*/
     0,                               /*tp_itemsize*/
@@ -453,56 +454,88 @@ static PyMethodDef module_methods[] = {
     {NULL}  /* Sentinal */
 };
 
+PyDoc_STRVAR(module_doc,
+"libev wrapper methods");
 
-#ifndef PyMODINIT_FUNC  /* declarations for DLL import/export */
-#define PyMODINIT_FUNC void
-#endif
-PyMODINIT_FUNC
+#if PY_MAJOR_VERSION >= 3
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    "libevwrapper",
+    module_doc,
+    -1,
+    module_methods,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+};
+
+#define INITERROR return NULL
+
+PyObject *
+PyInit_libevwrapper(void)
+
+# else
+# define INITERROR return
+
+void
 initlibevwrapper(void)
+#endif
 {
-    PyObject *m;
+    PyObject *module = NULL;
 
     if (PyType_Ready(&libevwrapper_LoopType) < 0)
-        return;
+        INITERROR;
 
     libevwrapper_IOType.tp_new = PyType_GenericNew;
     if (PyType_Ready(&libevwrapper_IOType) < 0)
-        return;
+        INITERROR;
 
     libevwrapper_PrepareType.tp_new = PyType_GenericNew;
     if (PyType_Ready(&libevwrapper_PrepareType) < 0)
-        return;
+        INITERROR;
 
     libevwrapper_AsyncType.tp_new = PyType_GenericNew;
     if (PyType_Ready(&libevwrapper_AsyncType) < 0)
-        return;
+        INITERROR;
 
-    m = Py_InitModule3("libevwrapper", module_methods, "libev wrapper methods");
+# if PY_MAJOR_VERSION >= 3
+    module = PyModule_Create(&moduledef);
+# else
+    module = Py_InitModule3("libevwrapper", module_methods, module_doc);
+# endif
 
-    if (PyModule_AddIntConstant(m, "EV_READ", EV_READ) == -1)
-        return;
-    if (PyModule_AddIntConstant(m, "EV_WRITE", EV_WRITE) == -1)
-        return;
-    if (PyModule_AddIntConstant(m, "EV_ERROR", EV_ERROR) == -1)
-        return;
+    if (module == NULL)
+        INITERROR;
+
+    if (PyModule_AddIntConstant(module, "EV_READ", EV_READ) == -1)
+        INITERROR;
+    if (PyModule_AddIntConstant(module, "EV_WRITE", EV_WRITE) == -1)
+        INITERROR;
+    if (PyModule_AddIntConstant(module, "EV_ERROR", EV_ERROR) == -1)
+        INITERROR;
 
     Py_INCREF(&libevwrapper_LoopType);
-    if (PyModule_AddObject(m, "Loop", (PyObject *)&libevwrapper_LoopType) == -1)
-        return;
+    if (PyModule_AddObject(module, "Loop", (PyObject *)&libevwrapper_LoopType) == -1)
+        INITERROR;
 
     Py_INCREF(&libevwrapper_IOType);
-    if (PyModule_AddObject(m, "IO", (PyObject *)&libevwrapper_IOType) == -1)
-        return;
+    if (PyModule_AddObject(module, "IO", (PyObject *)&libevwrapper_IOType) == -1)
+        INITERROR;
 
     Py_INCREF(&libevwrapper_PrepareType);
-    if (PyModule_AddObject(m, "Prepare", (PyObject *)&libevwrapper_PrepareType) == -1)
-        return;
+    if (PyModule_AddObject(module, "Prepare", (PyObject *)&libevwrapper_PrepareType) == -1)
+        INITERROR;
 
     Py_INCREF(&libevwrapper_AsyncType);
-    if (PyModule_AddObject(m, "Async", (PyObject *)&libevwrapper_AsyncType) == -1)
-        return;
+    if (PyModule_AddObject(module, "Async", (PyObject *)&libevwrapper_AsyncType) == -1)
+        INITERROR;
 
     if (!PyEval_ThreadsInitialized()) {
         PyEval_InitThreads();
     }
+
+#if PY_MAJOR_VERSION >= 3
+    return module;
+#endif
 }

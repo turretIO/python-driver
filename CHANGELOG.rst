@@ -1,6 +1,199 @@
+2.0.2
+=====
+
+Bug Fixes
+---------
+* Add six to requirements.txt
+* Avoid KeyError during schema refresh when a keyspace is dropped
+  and TokenAwarePolicy is not in use
+* Avoid registering multiple atexit() cleanup functions will the
+  asyncore event loop is restarted multiple times
+* Delay initialization of reactors in order to avoid problems
+  with shared state when using multiprocessing (PYTHON-60)
+* Add python-six to debian dependencies, move python-blist to
+  recommends
+
+2.0.1
+=====
+May 28, 2014
+
+Bug Fixes
+---------
+* Fix check for Cluster.is_shutdown in in @run_in_executor
+  decorator
+
+2.0.0
+=====
+May 28, 2014
+
+Features
+--------
+* Make libev C extension Python3-compatible (PYTHON-70)
+* Support v2 protocol authentication (PYTHON-73, github #125)
+
+Bug Fixes
+---------
+* Fix murmur3 C extension compilation under Python3.4 (github #124)
+
+Merged From 1.x
+---------------
+
+Features
+^^^^^^^^
+* Add Session.default_consistency_level (PYTHON-14)
+
+Bug Fixes
+^^^^^^^^^
+* Don't strip trailing underscores from column names when using the
+  named_tuple_factory (PYTHON-56)
+* Ensure replication factors are ints for NetworkTopologyStrategy
+  to avoid TypeErrors (github #120)
+* Pass WriteType instance to RetryPolicy.on_write_timeout() instead
+  of the string name of the write type. This caused write timeout
+  errors to always be rethrown instead of retrying. (github #123)
+* Avoid submitting tasks to the ThreadPoolExecutor after shutdown. With
+  retries enabled, this could cause Cluster.shutdown() to hang under
+  some circumstances.
+* Fix unintended rebuild of token replica map when keyspaces are
+  discovered (on startup), added, or updated and TokenAwarePolicy is not
+  in use.
+* Avoid rebuilding token metadata when cluster topology has not
+  actually changed
+* Avoid preparing queries for hosts that should be ignored (such as
+  remote hosts when using the DCAwareRoundRobinPolicy) (PYTHON-75)
+
+Other
+^^^^^
+* Add 1 second timeout to join() call on event loop thread during
+  interpreter shutdown.  This can help to prevent the process from
+  hanging during shutdown.
+
+2.0.0b1
+=======
+May 6, 2014
+
+Upgrading from 1.x
+------------------
+Cluster.shutdown() should always be called when you are done with a
+Cluster instance.  If it is not called, there are no guarantees that the
+driver will not hang.  However, if you *do* have a reproduceable case
+where Cluster.shutdown() is not called and the driver hangs, please
+report it so that we can attempt to fix it.
+
+If you're using the 2.0 driver against Cassandra 1.2, you will need
+to set your protocol version to 1.  For example:
+
+    cluster = Cluster(..., protocol_version=1)
+
+Features
+--------
+* Support v2 of Cassandra's native protocol, which includes the following
+  new features: automatic query paging support, protocol-level batch statements,
+  and lightweight transactions
+* Support for Python 3.3 and 3.4
+* Allow a default query timeout to be set per-Session
+
+Bug Fixes
+---------
+* Avoid errors during interpreter shutdown (the driver attempts to cleanup
+  daemonized worker threads before interpreter shutdown)
+
+Deprecations
+------------
+The following functions have moved from cassandra.decoder to cassandra.query.
+The original functions have been left in place with a DeprecationWarning for
+now:
+
+* cassandra.decoder.tuple_factory has moved to cassandra.query.tuple_factory
+* cassandra.decoder.named_tuple_factory has moved to cassandra.query.named_tuple_factory
+* cassandra.decoder.dict_factory has moved to cassandra.query.dict_factory
+* cassandra.decoder.ordered_dict_factory has moved to cassandra.query.ordered_dict_factory
+
+1.1.2
+=====
+May 8, 2014
+
+Features
+--------
+* Allow a specific compression type to be requested for communications with
+  Cassandra and prefer lz4 if available
+
+Bug Fixes
+---------
+* Update token metadata (for TokenAware calculations) when a node is removed
+  from the ring
+* Fix file handle leak with gevent reactor due to blocking Greenlet kills when
+  closing excess connections
+* Avoid handling a node coming up multiple times due to a reconnection attempt
+  succeeding close to the same time that an UP notification is pushed
+* Fix duplicate node-up handling, which could result in multiple reconnectors
+  being started as well as the executor threads becoming deadlocked, preventing
+  future node up or node down handling from being executed.
+* Handle exhausted ReconnectionPolicy schedule correctly
+
+Other
+-----
+* Don't log at ERROR when a connection is closed during the startup
+  communications
+* Mke scales, blist optional dependencies
+
+1.1.1
+=====
+April 16, 2014
+
+Bug Fixes
+---------
+* Fix unconditional import of nose in setup.py (github #111)
+
+1.1.0
+=====
+April 16, 2014
+
+Features
+--------
+* Gevent is now supported through monkey-patching the stdlib (PYTHON-7,
+  github issue #46)
+* Support static columns in schemas, which are available starting in
+  Cassandra 2.1. (github issue #91)
+* Add debian packaging (github issue #101)
+* Add utility methods for easy concurrent execution of statements. See
+  the new cassandra.concurrent module. (github issue #7)
+
+Bug Fixes
+---------
+* Correctly supply compaction and compression parameters in CREATE statements
+  for tables when working with Cassandra 2.0+
+* Lowercase boolean literals when generating schemas
+* Ignore SSL_ERROR_WANT_READ and SSL_ERROR_WANT_WRITE socket errors.  Previously,
+  these resulted in the connection being defuncted, but they can safely be
+  ignored by the driver.
+* Don't reconnect the control connection every time Cluster.connect() is
+  called
+* Avoid race condition that could leave ResponseFuture callbacks uncalled
+  if the callback was added outside of the event loop thread (github issue #95)
+* Properly escape keyspace name in Session.set_keyspace().  Previously, the
+  keyspace name was quoted, but any quotes in the string were not escaped.
+* Avoid adding hosts to the load balancing policy before their datacenter
+  and rack information has been set, if possible.
+* Avoid KeyError when updating metadata after droping a table (github issues
+  #97, #98)
+* Use tuples instead of sets for DCAwareLoadBalancingPolicy to ensure equal
+  distribution of requests
+
+Other
+-----
+* Don't ignore column names when parsing typestrings.  This is needed for
+  user-defined type support.  (github issue #90)
+* Better error message when libevwrapper is not found
+* Only try to import scales when metrics are enabled (github issue #92)
+* Cut down on the number of queries executing when a new Cluster
+  connects and when the control connection has to reconnect (github issue #104,
+  PYTHON-59)
+* Issue warning log when schema versions do not match
+
 1.0.2
 =====
-In Progress
+March 4, 2014
 
 Bug Fixes
 ---------
@@ -15,6 +208,8 @@ Bug Fixes
   TimestampType to fix sorting of pre-unix epoch dates in CASSANDRA-5723.)
 * Handle latest table options when parsing the schema and generating
   CREATE statements.
+* Avoid 'Set changed size during iteration' during query plan generation
+  when hosts go up or down
 
 Other
 -----

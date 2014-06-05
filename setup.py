@@ -1,16 +1,26 @@
-import platform
-import os
-import sys
-import warnings
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-try:
-    import subprocess
-    has_subprocess = True
-except ImportError:
-    has_subprocess = False
+from __future__ import print_function
+import sys
 
 import ez_setup
 ez_setup.use_setuptools()
+
+if __name__ == '__main__' and sys.argv[1] == "gevent_nosetests":
+    from gevent.monkey import patch_all
+    patch_all()
 
 from setuptools import setup
 from distutils.command.build_ext import build_ext
@@ -19,11 +29,30 @@ from distutils.errors import (CCompilerError, DistutilsPlatformError,
                               DistutilsExecError)
 from distutils.cmd import Command
 
+
+import os
+import warnings
+
+try:
+    import subprocess
+    has_subprocess = True
+except ImportError:
+    has_subprocess = False
+
 from cassandra import __version__
 
 long_description = ""
 with open("README.rst") as f:
     long_description = f.read()
+
+
+try:
+    from nose.commands import nosetests
+except ImportError:
+    gevent_nosetests = None
+else:
+    class gevent_nosetests(nosetests):
+        description = "run nosetests with gevent monkey patching"
 
 
 class DocCommand(Command):
@@ -62,11 +91,11 @@ class DocCommand(Command):
             except subprocess.CalledProcessError as exc:
                 raise RuntimeError("Documentation step '%s' failed: %s: %s" % (mode, exc, exc.output))
             else:
-                print output
+                print(output)
 
-            print ""
-            print "Documentation step '%s' performed, results here:" % mode
-            print "   %s/" % path
+            print("")
+            print("Documentation step '%s' performed, results here:" % mode)
+            print("   %s/" % path)
 
 
 class BuildFailed(Exception):
@@ -144,13 +173,14 @@ On OSX, via homebrew:
 
 def run_setup(extensions):
     kw = {'cmdclass': {'doc': DocCommand}}
+    if gevent_nosetests is not None:
+        kw['cmdclass']['gevent_nosetests'] = gevent_nosetests
+
     if extensions:
         kw['cmdclass']['build_ext'] = build_extensions
         kw['ext_modules'] = extensions
 
-    dependencies = ['futures', 'scales', 'blist']
-    if platform.python_implementation() != "CPython":
-        dependencies.remove('blist')
+    dependencies = ['futures', 'six >=1.6']
 
     setup(
         name='cassandra-driver',
@@ -163,7 +193,7 @@ def run_setup(extensions):
         packages=['cassandra', 'cassandra.io'],
         include_package_data=True,
         install_requires=dependencies,
-        tests_require=['nose', 'mock', 'ccm', 'unittest2', 'PyYAML'],
+        tests_require=['nose', 'mock', 'PyYAML', 'pytz'],
         classifiers=[
             'Development Status :: 5 - Production/Stable',
             'Intended Audience :: Developers',
@@ -171,9 +201,12 @@ def run_setup(extensions):
             'Natural Language :: English',
             'Operating System :: OS Independent',
             'Programming Language :: Python',
-            'Programming Language :: Python :: 2',
             'Programming Language :: Python :: 2.6',
             'Programming Language :: Python :: 2.7',
+            'Programming Language :: Python :: 3.3',
+            'Programming Language :: Python :: 3.4',
+            'Programming Language :: Python :: Implementation :: CPython',
+            'Programming Language :: Python :: Implementation :: PyPy',
             'Topic :: Software Development :: Libraries :: Python Modules'
         ],
         **kw)
@@ -188,6 +221,7 @@ elif "--no-murmur3" in sys.argv:
 elif "--no-libev" in sys.argv:
     sys.argv = [a for a in sys.argv if a != "--no-libev"]
     extensions.remove(libev_ext)
+
 
 platform_unsupported_msg = \
 """

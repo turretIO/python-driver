@@ -1,15 +1,36 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 This module houses the main classes you will interact with,
 :class:`.Cluster` and :class:`.Session`.
 """
+from __future__ import absolute_import
 
+import atexit
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import socket
 import sys
 import time
 from threading import Lock, RLock, Thread, Event
-import Queue
+
+import six
+from six.moves import range
+from six.moves import queue as Queue
+
 import weakref
 from weakref import WeakValueDictionary
 try:
@@ -20,32 +41,39 @@ except ImportError:
 from functools import partial, wraps
 from itertools import groupby
 
-from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut
+from cassandra import (ConsistencyLevel, AuthenticationFailed,
+                       OperationTimedOut, UnsupportedOperation)
 from cassandra.connection import ConnectionException, ConnectionShutdown
-from cassandra.decoder import (QueryMessage, ResultMessage,
-                               ErrorMessage, ReadTimeoutErrorMessage,
-                               WriteTimeoutErrorMessage,
-                               UnavailableErrorMessage,
-                               OverloadedErrorMessage,
-                               PrepareMessage, ExecuteMessage,
-                               PreparedQueryNotFound,
-                               IsBootstrappingErrorMessage, named_tuple_factory,
-                               dict_factory)
-from cassandra.metadata import Metadata
-from cassandra.metrics import Metrics
+from cassandra.protocol import (QueryMessage, ResultMessage,
+                                ErrorMessage, ReadTimeoutErrorMessage,
+                                WriteTimeoutErrorMessage,
+                                UnavailableErrorMessage,
+                                OverloadedErrorMessage,
+                                PrepareMessage, ExecuteMessage,
+                                PreparedQueryNotFound,
+                                IsBootstrappingErrorMessage,
+                                BatchMessage, RESULT_KIND_PREPARED,
+                                RESULT_KIND_SET_KEYSPACE, RESULT_KIND_ROWS,
+                                RESULT_KIND_SCHEMA_CHANGE)
+from cassandra.metadata import Metadata, protect_name
 from cassandra.policies import (RoundRobinPolicy, SimpleConvictionPolicy,
                                 ExponentialReconnectionPolicy, HostDistance,
                                 RetryPolicy)
 from cassandra.pool import (_ReconnectionHandler, _HostReconnectionHandler,
-                            HostConnectionPool)
+                            HostConnectionPool, NoConnectionsAvailable)
 from cassandra.query import (SimpleStatement, PreparedStatement, BoundStatement,
-                             bind_params, QueryTrace, Statement)
+                             BatchStatement, bind_params, QueryTrace, Statement,
+                             named_tuple_factory, dict_factory)
 
-# libev is all around faster, so we want to try and default to using that when we can
-try:
-    from cassandra.io.libevreactor import LibevConnection as DefaultConnection
-except ImportError:
-    from cassandra.io.asyncorereactor import AsyncoreConnection as DefaultConnection  # NOQA
+# default to gevent when we are monkey patched, otherwise if libev is available, use that as the
+# default because it's faster than asyncore
+if 'gevent.monkey' in sys.modules:
+    from cassandra.io.geventreactor import GeventConnection as DefaultConnection
+else:
+    try:
+        from cassandra.io.libevreactor import LibevConnection as DefaultConnection  # NOQA
+    except ImportError:
+        from cassandra.io.asyncorereactor import AsyncoreConnection as DefaultConnection  # NOQA
 
 # Forces load of utf8 encoding module to avoid deadlock that occurs
 # if code that is being imported tries to import the module in a seperate
@@ -102,6 +130,8 @@ def run_in_executor(f):
     @wraps(f)
     def new_f(self, *args, **kwargs):
 
+        if self.is_shutdown:
+            return
         try:
             future = self.executor.submit(f, self, *args, **kwargs)
             future.add_done_callback(_future_completed)
@@ -109,6 +139,11 @@ def run_in_executor(f):
             log.exception("Failed to submit task to executor")
 
     return new_f
+
+
+def _shutdown_cluster(cluster):
+    if cluster and not cluster.is_shutdown:
+        cluster.shutdown()
 
 
 class Cluster(object):
@@ -140,17 +175,64 @@ class Cluster(object):
     server will be automatically used.
     """
 
-    compression = True
+    protocol_version = 2
     """
-    Whether or not compression should be enabled when possible. Defaults to
-    :const:`True` and attempts to use snappy compression.
+    The version of the native protocol to use.  The protocol version 2
+    add support for lightweight transactions, batch operations, and
+    automatic query paging, but is only supported by Cassandra 2.0+.  When
+    working with Cassandra 1.2, this must be set to 1.  You can also set
+    this to 1 when working with Cassandra 2.0+, but features that require
+    the version 2 protocol will not be enabled.
     """
 
-    auth_provider = None
+    compression = True
     """
-    An optional function that accepts one argument, the IP address of a node,
-    and returns a dict of credentials for that node.
+    Controls compression for communications between the driver and Cassandra.
+    If left as the default of :const:`True`, either lz4 or snappy compression
+    may be used, depending on what is supported by both the driver
+    and Cassandra.  If both are fully supported, lz4 will be preferred.
+
+    You may also set this to 'snappy' or 'lz4' to request that specific
+    compression type.
+
+    Setting this to :const:`False` disables compression.
     """
+
+    _auth_provider = None
+    _auth_provider_callable = None
+
+    @property
+    def auth_provider(self):
+        """
+        When :attr:`~.Cluster.protocol_version` is 2 or higher, this should
+        be an instance of a subclass of :class:`~cassandra.auth.AuthProvider`,
+        such as :class:`~.PlainTextAuthProvider`.
+
+        When :attr:`~.Cluster.protocol_version` is 1, this should be
+        a function that accepts one argument, the IP address of a node,
+        and returns a dict of credentials for that node.
+
+        When not using authentication, this should be left as :const:`None`.
+        """
+        return self._auth_provider
+
+    @auth_provider.setter  # noqa
+    def auth_provider(self, value):
+        if not value:
+            self._auth_provider = value
+            return
+
+        try:
+            self._auth_provider_callable = value.new_authenticator
+        except AttributeError:
+            if self.protocol_version > 1:
+                raise TypeError("auth_provider must implement the cassandra.auth.AuthProvider "
+                                "interface when protocol_version >= 2")
+            elif not callable(value):
+                raise TypeError("auth_provider must be callable when protocol_version == 1")
+            self._auth_provider_callable = value
+
+        self._auth_provider = value
 
     load_balancing_policy = None
     """
@@ -182,12 +264,12 @@ class Cluster(object):
     metrics_enabled = False
     """
     Whether or not metric collection is enabled.  If enabled, :attr:`.metrics`
-    will be an instance of :class:`.metrics.Metrics`.
+    will be an instance of :class:`~cassandra.metrics.Metrics`.
     """
 
     metrics = None
     """
-    An instance of :class:`.metrics.Metrics` if :attr:`.metrics_enabled` is
+    An instance of :class:`cassandra.metrics.Metrics` if :attr:`.metrics_enabled` is
     :const:`True`, else :const:`None`.
     """
 
@@ -247,7 +329,7 @@ class Cluster(object):
     control_connection = None
     scheduler = None
     executor = None
-    _is_shutdown = False
+    is_shutdown = False
     _is_setup = False
     _prepared_statements = None
     _prepared_statement_lock = Lock()
@@ -269,6 +351,7 @@ class Cluster(object):
                  ssl_options=None,
                  sockopts=None,
                  cql_version=None,
+                 protocol_version=2,
                  executor_threads=2,
                  max_schema_agreement_wait=10,
                  control_connection_timeout=2.0):
@@ -276,21 +359,11 @@ class Cluster(object):
         Any of the mutable Cluster attributes may be set as keyword arguments
         to the constructor.
         """
-        if 'gevent.monkey' in sys.modules:
-            raise Exception(
-                "gevent monkey-patching detected. This driver does not currently "
-                "support gevent, and monkey patching will break the driver "
-                "completely. You can track progress towards adding gevent "
-                "support here: https://datastax-oss.atlassian.net/browse/PYTHON-7.")
-
         self.contact_points = contact_points
         self.port = port
         self.compression = compression
-
-        if auth_provider is not None:
-            if not callable(auth_provider):
-                raise ValueError("auth_provider must be callable")
-            self.auth_provider = auth_provider
+        self.protocol_version = protocol_version
+        self.auth_provider = auth_provider
 
         if load_balancing_policy is not None:
             if isinstance(load_balancing_policy, type):
@@ -364,6 +437,7 @@ class Cluster(object):
         self._lock = RLock()
 
         if self.metrics_enabled:
+            from cassandra.metrics import Metrics
             self.metrics = Metrics(weakref.proxy(self))
 
         self.control_connection = ControlConnection(
@@ -433,14 +507,15 @@ class Cluster(object):
         return partial(self.connection_class.factory, host.address, *args, **kwargs)
 
     def _make_connection_kwargs(self, address, kwargs_dict):
-        if self.auth_provider:
-            kwargs_dict['credentials'] = self.auth_provider(address)
+        if self._auth_provider_callable:
+            kwargs_dict['authenticator'] = self._auth_provider_callable(address)
 
         kwargs_dict['port'] = self.port
         kwargs_dict['compression'] = self.compression
         kwargs_dict['sockopts'] = self.sockopts
         kwargs_dict['ssl_options'] = self.ssl_options
         kwargs_dict['cql_version'] = self.cql_version
+        kwargs_dict['protocol_version'] = self.protocol_version
 
         return kwargs_dict
 
@@ -451,10 +526,12 @@ class Cluster(object):
         operations on the ``Session``.
         """
         with self._lock:
-            if self._is_shutdown:
+            if self.is_shutdown:
                 raise Exception("Cluster is already shut down")
 
             if not self._is_setup:
+                self.connection_class.initialize_reactor()
+                atexit.register(partial(_shutdown_cluster, self))
                 for address in self.contact_points:
                     host = self.add_host(address, signal=False)
                     if host:
@@ -464,19 +541,20 @@ class Cluster(object):
 
                 self.load_balancing_policy.populate(
                     weakref.proxy(self), self.metadata.all_hosts())
+
+                if self.control_connection:
+                    try:
+                        self.control_connection.connect(keyspace)
+                        log.debug("Control connection created")
+                    except Exception:
+                        log.exception("Control connection failed to connect, "
+                                      "shutting down Cluster:")
+                        self.shutdown()
+                        raise
+
+                self.load_balancing_policy.check_supported()
+
                 self._is_setup = True
-
-            if self.control_connection:
-                try:
-                    self.control_connection.connect(keyspace)
-                    log.debug("Control connection created")
-                except Exception:
-                    log.exception("Control connection failed to connect, "
-                                  "shutting down Cluster:")
-                    self.shutdown()
-                    raise
-
-            self.load_balancing_policy.check_supported()
 
         session = self._new_session()
         if keyspace:
@@ -492,10 +570,10 @@ class Cluster(object):
         Once shutdown, a Cluster should not be used for any purpose.
         """
         with self._lock:
-            if self._is_shutdown:
-                raise Exception("The Cluster was already shutdown")
+            if self.is_shutdown:
+                return
             else:
-                self._is_shutdown = True
+                self.is_shutdown = True
 
         if self.scheduler:
             self.scheduler.shutdown()
@@ -509,19 +587,6 @@ class Cluster(object):
 
         if self.executor:
             self.executor.shutdown()
-
-    def __del__(self):
-        # we don't use shutdown() because we want to avoid shutting down
-        # Sessions while they are still being used (in case there are no
-        # longer any references to this Cluster object, but there are
-        # still references to the Session object)
-        if not self._is_shutdown:
-            if self.scheduler:
-                self.scheduler.shutdown()
-            if self.control_connection:
-                self.control_connection.shutdown()
-            if self.executor:
-                self.executor.shutdown(wait=False)
 
     def _new_session(self):
         session = Session(self, self.metadata.all_hosts())
@@ -565,11 +630,8 @@ class Cluster(object):
             for listener in self.listeners:
                 listener.on_up(host)
         finally:
-            host._handle_node_up_condition.acquire()
-            if host._currently_handling_node_up:
+            with host.lock:
                 host._currently_handling_node_up = False
-                host._handle_node_up_condition.notify()
-            host._handle_node_up_condition.release()
 
         # see if there are any pools to add or remove now that the host is marked up
         for session in self.sessions:
@@ -579,21 +641,26 @@ class Cluster(object):
         """
         Intended for internal use only.
         """
-        if self._is_shutdown:
+        if self.is_shutdown:
             return
 
-        host._handle_node_up_condition.acquire()
-        while host._currently_handling_node_up:
-            host._handle_node_up_condition.wait()
-        host.handling_up_down = True
-        host._handle_node_up_condition.release()
+        log.debug("Waiting to acquire lock for handling up status of node %s", host)
+        with host.lock:
+            if host._currently_handling_node_up:
+                log.debug("Another thread is already handling up status of node %s", host)
+                return
 
-        if host.is_up:
-            return
+            if host.is_up:
+                log.debug("Host %s was already marked up", host)
+                return
 
+            host._currently_handling_node_up = True
+        log.debug("Starting to handle up status of node %s", host)
+
+        have_future = False
         futures = set()
         try:
-            log.info("Host %s has been marked up", host)
+            log.info("Host %s may be up; will prepare queries and open connection pool", host)
 
             reconnector = host.get_and_set_reconnection_handler(None)
             if reconnector:
@@ -601,20 +668,25 @@ class Cluster(object):
                 reconnector.cancel()
 
             self._prepare_all_queries(host)
-            log.debug("Done preparing all queries for host %s", host)
+            log.debug("Done preparing all queries for host %s, ", host)
 
             for session in self.sessions:
                 session.remove_pool(host)
 
+            log.debug("Signalling to load balancing policy that host %s is up", host)
             self.load_balancing_policy.on_up(host)
+
+            log.debug("Signalling to control connection that host %s is up", host)
             self.control_connection.on_up(host)
 
+            log.debug("Attempting to open new connection pools for host %s", host)
             futures_lock = Lock()
             futures_results = []
             callback = partial(self._on_up_future_completed, host, futures, futures_results, futures_lock)
             for session in self.sessions:
                 future = session.add_or_renew_pool(host, is_host_addition=False)
                 if future is not None:
+                    have_future = True
                     future.add_done_callback(callback)
                     futures.add(future)
         except Exception:
@@ -624,11 +696,13 @@ class Cluster(object):
 
             self._cleanup_failed_on_up_handling(host)
 
-            host._handle_node_up_condition.acquire()
-            host._currently_handling_node_up = False
-            host._handle_node_up_condition.notify()
-            host._handle_node_up_condition.release()
+            with host.lock:
+                host._currently_handling_node_up = False
             raise
+        else:
+            if not have_future:
+                with host.lock:
+                    host._currently_handling_node_up = False
 
         # for testing purposes
         return futures
@@ -651,24 +725,24 @@ class Cluster(object):
             log.debug("Old host reconnector found for %s, cancelling", host)
             old_reconnector.cancel()
 
-        log.debug("Staring reconnector for host %s", host)
+        log.debug("Starting reconnector for host %s", host)
         reconnector.start()
 
     @run_in_executor
-    def on_down(self, host, is_host_addition, force_if_down=False):
+    def on_down(self, host, is_host_addition, expect_host_to_be_down=False):
         """
         Intended for internal use only.
         """
-        if self._is_shutdown:
+        if self.is_shutdown:
             return
 
         with host.lock:
-            if (not (host.is_up or force_if_down)) or host.is_currently_reconnecting():
+            if (not host.is_up and not expect_host_to_be_down) or host.is_currently_reconnecting():
                 return
 
             host.set_down()
 
-        log.warn("Host %s has been marked down", host)
+        log.warning("Host %s has been marked down", host)
 
         self.load_balancing_policy.on_down(host)
         self.control_connection.on_down(host)
@@ -681,15 +755,24 @@ class Cluster(object):
         self._start_reconnector(host, is_host_addition)
 
     def on_add(self, host):
-        if self._is_shutdown:
+        if self.is_shutdown:
             return
 
-        log.debug("Adding or renewing pools for new host %s and notifying listeners", host)
-        self._prepare_all_queries(host)
-        log.debug("Done preparing queries for new host %s", host)
+        log.debug("Handling new host %r and notifying listeners", host)
+
+        distance = self.load_balancing_policy.distance(host)
+        if distance != HostDistance.IGNORED:
+            self._prepare_all_queries(host)
+            log.debug("Done preparing queries for new host %r", host)
 
         self.load_balancing_policy.on_add(host)
         self.control_connection.on_add(host)
+
+        if distance == HostDistance.IGNORED:
+            log.debug("Not adding connection pool for new host %r because the "
+                      "load balancing policy has marked it as IGNORED", host)
+            self._finalize_add(host)
+            return
 
         futures_lock = Lock()
         futures_results = []
@@ -714,7 +797,7 @@ class Cluster(object):
                 return
 
             if not all(futures_results):
-                log.warn("Connection pool could not be created, not marking node %s up", host)
+                log.warning("Connection pool could not be created, not marking node %s up", host)
                 return
 
             self._finalize_add(host)
@@ -741,7 +824,7 @@ class Cluster(object):
             session.update_created_pools()
 
     def on_remove(self, host):
-        if self._is_shutdown:
+        if self.is_shutdown:
             return
 
         log.debug("Removing host %s", host)
@@ -751,22 +834,23 @@ class Cluster(object):
             session.on_remove(host)
         for listener in self.listeners:
             listener.on_remove(host)
+        self.control_connection.on_remove(host)
 
-    def signal_connection_failure(self, host, connection_exc, is_host_addition):
+    def signal_connection_failure(self, host, connection_exc, is_host_addition, expect_host_to_be_down=False):
         is_down = host.signal_connection_failure(connection_exc)
         if is_down:
-            self.on_down(host, is_host_addition, force_if_down=True)
+            self.on_down(host, is_host_addition, expect_host_to_be_down)
         return is_down
 
-    def add_host(self, address, signal):
+    def add_host(self, address, datacenter=None, rack=None, signal=True):
         """
         Called when adding initial contact points and when the control
         connection subsequently discovers a new node.  Intended for internal
         use only.
         """
-        new_host = self.metadata.add_host(address)
+        new_host = self.metadata.add_host(address, datacenter, rack)
         if new_host and signal:
-            log.info("New Cassandra host %s added", address)
+            log.info("New Cassandra host %r discovered", new_host)
             self.on_add(new_host)
 
         return new_host
@@ -838,7 +922,7 @@ class Cluster(object):
                 # prepare 10 statements at a time
                 ks_statements = list(ks_statements)
                 chunks = []
-                for i in xrange(0, len(ks_statements), 10):
+                for i in range(0, len(ks_statements), 10):
                     chunks.append(ks_statements[i:i + 10])
 
                 for ks_chunk in chunks:
@@ -847,15 +931,15 @@ class Cluster(object):
                     responses = connection.wait_for_responses(*messages, timeout=5.0)
                     for response in responses:
                         if (not isinstance(response, ResultMessage) or
-                                response.kind != ResultMessage.KIND_PREPARED):
+                                response.kind != RESULT_KIND_PREPARED):
                             log.debug("Got unexpected response when preparing "
                                       "statement on host %s: %r", host, response)
 
             log.debug("Done preparing all known prepared statements against host %s", host)
         except OperationTimedOut as timeout:
-            log.warn("Timed out trying to prepare all statements on host %s: %s", host, timeout)
+            log.warning("Timed out trying to prepare all statements on host %s: %s", host, timeout)
         except (ConnectionException, socket.error) as exc:
-            log.warn("Error trying to prepare all statements on host %s: %r", host, exc)
+            log.warning("Error trying to prepare all statements on host %s: %r", host, exc)
         except Exception:
             log.exception("Error trying to prepare all statements on host %s", host)
         finally:
@@ -898,10 +982,10 @@ class Session(object):
     returned row will be a named tuple.  You can alternatively
     use any of the following:
 
-      - :func:`cassandra.decoder.tuple_factory` - return a result row as a tuple
-      - :func:`cassandra.decoder.named_tuple_factory` - return a result row as a named tuple
-      - :func:`cassandra.decoder.dict_factory` - return a result row as a dict
-      - :func:`cassandra.decoder.ordered_dict_factory` - return a result row as an OrderedDict
+      - :func:`cassandra.query.tuple_factory` - return a result row as a tuple
+      - :func:`cassandra.query.named_tuple_factory` - return a result row as a named tuple
+      - :func:`cassandra.query.dict_factory` - return a result row as a dict
+      - :func:`cassandra.query.ordered_dict_factory` - return a result row as an OrderedDict
 
     """
 
@@ -918,6 +1002,17 @@ class Session(object):
     on a :class:`~.ResponseFuture` through :meth:`.ResponseFuture.add_callback` or
     :meth:`.ResponseFuture.add_errback`; even if a query exceeds this default
     timeout, neither the registered callback or errback will be called.
+
+    .. versionadded:: 2.0.0
+    """
+
+    default_consistency_level = ConsistencyLevel.ONE
+    """
+    The default :class:`~ConsistencyLevel` for operations executed through
+    this session.  This default may be overridden by setting the
+    :attr:`~.Statement.consistency_level` on individual statements.
+
+    .. versionadded:: 1.2.0
     """
 
     max_trace_wait = 2.0
@@ -930,10 +1025,22 @@ class Session(object):
     hit.  If the limit is passed, an error will be logged and the
     :attr:`.Statement.trace` will be left as :const:`None`. """
 
+    default_fetch_size = 5000
+    """
+    By default, this many rows will be fetched at a time.  This can be
+    specified per-query through :attr:`.Statement.fetch_size`.
+
+    This only takes effect when protocol version 2 or higher is used.
+    See :attr:`.Cluster.protocol_version` for details.
+
+    .. versionadded:: 2.0.0
+    """
+
     _lock = None
     _pools = None
     _load_balancer = None
     _metrics = None
+    _protocol_version = None
 
     def __init__(self, cluster, hosts):
         self.cluster = cluster
@@ -943,6 +1050,7 @@ class Session(object):
         self._pools = {}
         self._load_balancer = cluster.load_balancing_policy
         self._metrics = cluster.metrics
+        self._protocol_version = self.cluster.protocol_version
 
         # create connection pools in parallel
         futures = []
@@ -1045,23 +1153,39 @@ class Session(object):
 
     def _create_response_future(self, query, parameters, trace):
         """ Returns the ResponseFuture before calling send_request() on it """
+
         prepared_statement = None
-        if isinstance(query, basestring):
+
+        if isinstance(query, six.string_types):
             query = SimpleStatement(query)
         elif isinstance(query, PreparedStatement):
             query = query.bind(parameters)
 
-        if isinstance(query, BoundStatement):
-            message = ExecuteMessage(
-                query_id=query.prepared_statement.query_id,
-                query_params=query.values,
-                consistency_level=query.consistency_level)
-            prepared_statement = query.prepared_statement
-        else:
+        cl = query.consistency_level if query.consistency_level is not None else self.default_consistency_level
+        fetch_size = query.fetch_size
+        if not fetch_size and self._protocol_version >= 2:
+            fetch_size = self.default_fetch_size
+
+        if isinstance(query, SimpleStatement):
             query_string = query.query_string
             if parameters:
                 query_string = bind_params(query.query_string, parameters)
-            message = QueryMessage(query=query_string, consistency_level=query.consistency_level)
+            message = QueryMessage(
+                query_string, cl, query.serial_consistency_level,
+                fetch_size=fetch_size)
+        elif isinstance(query, BoundStatement):
+            message = ExecuteMessage(
+                query.prepared_statement.query_id, query.values, cl,
+                query.serial_consistency_level, fetch_size=fetch_size)
+            prepared_statement = query.prepared_statement
+        elif isinstance(query, BatchStatement):
+            if self._protocol_version < 2:
+                raise UnsupportedOperation(
+                    "BatchStatement execution is only supported with protocol version "
+                    "2 or higher (supported in Cassandra 2.0 and higher).  Consider "
+                    "setting Cluster.protocol_version to 2 to support this operation.")
+            message = BatchMessage(
+                query.batch_type, query._statements_and_parameters, cl)
 
         if trace:
             message.tracing = True
@@ -1163,13 +1287,6 @@ class Session(object):
         for pool in self._pools.values():
             pool.shutdown()
 
-    def __del__(self):
-        try:
-            self.shutdown()
-            del self.cluster
-        except TypeError:
-            pass
-
     def add_or_renew_pool(self, host, is_host_addition):
         """
         For internal use only.
@@ -1186,8 +1303,12 @@ class Session(object):
                 self.cluster.signal_connection_failure(host, conn_exc, is_host_addition)
                 return False
             except Exception as conn_exc:
-                log.warn("Failed to create connection pool for new host %s: %s", host, conn_exc)
-                self.cluster.signal_connection_failure(host, conn_exc, is_host_addition)
+                log.warning("Failed to create connection pool for new host %s: %s",
+                            host, conn_exc)
+                # the host itself will still be marked down, so we need to pass
+                # a special flag to make sure the reconnector is created
+                self.cluster.signal_connection_failure(
+                        host, conn_exc, is_host_addition, expect_host_to_be_down=True)
                 return False
 
             previous = self._pools.get(host)
@@ -1252,7 +1373,7 @@ class Session(object):
         Set the default keyspace for all queries made through this Session.
         This operation blocks until complete.
         """
-        self.execute('USE "%s"' % (keyspace,))
+        self.execute('USE %s' % (protect_name(keyspace),))
 
     def _set_keyspace_for_all_pools(self, keyspace, callback):
         """
@@ -1283,7 +1404,8 @@ class Session(object):
 
     def submit(self, fn, *args, **kwargs):
         """ Internal """
-        return self.cluster.executor.submit(fn, *args, **kwargs)
+        if not self.is_shutdown:
+            return self.cluster.executor.submit(fn, *args, **kwargs)
 
     def get_pool_state(self):
         return dict((host, pool.get_state()) for host, pool in self._pools.items())
@@ -1314,6 +1436,28 @@ class _ControlReconnectionHandler(_ReconnectionHandler):
             return True
 
 
+def _watch_callback(obj_weakref, method_name, *args, **kwargs):
+    """
+    A callback handler for the ControlConnection that tolerates
+    weak references.
+    """
+    obj = obj_weakref()
+    if obj is None:
+        return
+    getattr(obj, method_name)(*args, **kwargs)
+
+
+def _clear_watcher(conn, expiring_weakref):
+    """
+    Called when the ControlConnection object is about to be finalized.
+    This clears watchers on the underlying Connection object.
+    """
+    try:
+        conn.control_conn_disposed()
+    except ReferenceError:
+        pass
+
+
 class ControlConnection(object):
     """
     Internal
@@ -1323,8 +1467,8 @@ class ControlConnection(object):
     _SELECT_COLUMN_FAMILIES = "SELECT * FROM system.schema_columnfamilies"
     _SELECT_COLUMNS = "SELECT * FROM system.schema_columns"
 
-    _SELECT_PEERS = "SELECT peer, data_center, rack, tokens, rpc_address FROM system.peers"
-    _SELECT_LOCAL = "SELECT cluster_name, data_center, rack, tokens, partitioner FROM system.local WHERE key='local'"
+    _SELECT_PEERS = "SELECT peer, data_center, rack, tokens, rpc_address, schema_version FROM system.peers"
+    _SELECT_LOCAL = "SELECT cluster_name, data_center, rack, tokens, partitioner, schema_version FROM system.local WHERE key='local'"
 
     _SELECT_SCHEMA_PEERS = "SELECT rpc_address, schema_version FROM system.peers"
     _SELECT_SCHEMA_LOCAL = "SELECT schema_version FROM system.local WHERE key='local'"
@@ -1381,11 +1525,11 @@ class ControlConnection(object):
                 return self._try_connect(host, keyspace)
             except ConnectionException as exc:
                 errors[host.address] = exc
-                log.warn("[control connection] Error connecting to %s:", host, exc_info=True)
+                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
                 self._cluster.signal_connection_failure(host, exc, is_host_addition=False)
             except Exception as exc:
                 errors[host.address] = exc
-                log.warn("[control connection] Error connecting to %s:", host, exc_info=True)
+                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
 
         raise NoHostAvailable("Unable to connect to any servers", errors)
 
@@ -1395,20 +1539,31 @@ class ControlConnection(object):
         node/token and schema metadata.
         """
         log.debug("[control connection] Opening new connection to %s", host)
-        connection = self._cluster.connection_factory(host.address)
+        connection = self._cluster.connection_factory(host.address, is_control_connection=True)
 
         log.debug("[control connection] Established new connection %r, "
                   "registering watchers and refreshing schema and topology",
                   connection)
+
+        # use weak references in both directions
+        # _clear_watcher will be called when this ControlConnection is about to be finalized
+        # _watch_callback will get the actual callback from the Connection and relay it to
+        # this object (after a dereferencing a weakref)
+        self_weakref = weakref.ref(self, callback=partial(_clear_watcher, weakref.proxy(connection)))
         try:
             connection.register_watchers({
-                "TOPOLOGY_CHANGE": self._handle_topology_change,
-                "STATUS_CHANGE": self._handle_status_change,
-                "SCHEMA_CHANGE": self._handle_schema_change
-            })
+                "TOPOLOGY_CHANGE": partial(_watch_callback, self_weakref, '_handle_topology_change'),
+                "STATUS_CHANGE": partial(_watch_callback, self_weakref, '_handle_status_change'),
+                "SCHEMA_CHANGE": partial(_watch_callback, self_weakref, '_handle_schema_change')
+            }, register_timeout=self._timeout)
 
-            self._refresh_node_list_and_token_map(connection)
-            self._refresh_schema(connection, keyspace)
+            peers_query = QueryMessage(query=self._SELECT_PEERS, consistency_level=ConsistencyLevel.ONE)
+            local_query = QueryMessage(query=self._SELECT_LOCAL, consistency_level=ConsistencyLevel.ONE)
+            shared_results = connection.wait_for_responses(
+                peers_query, local_query, timeout=self._timeout)
+
+            self._refresh_node_list_and_token_map(connection, preloaded_results=shared_results)
+            self._refresh_schema(connection, preloaded_results=shared_results)
         except Exception:
             connection.close()
             raise
@@ -1419,7 +1574,7 @@ class ControlConnection(object):
         if self._is_shutdown:
             return
 
-        self._cluster.executor.submit(self._reconnect)
+        self._submit(self._reconnect)
 
     def _reconnect(self):
         log.debug("[control connection] Attempting to reconnect")
@@ -1458,6 +1613,14 @@ class ControlConnection(object):
             self._reconnection_handler = new_handler
             return old
 
+    def _submit(self, *args, **kwargs):
+        try:
+            if not self._cluster.is_shutdown:
+                return self._cluster.executor.submit(*args, **kwargs)
+        except ReferenceError:
+            pass
+        return None
+
     def shutdown(self):
         with self._lock:
             if self._is_shutdown:
@@ -1465,23 +1628,33 @@ class ControlConnection(object):
             else:
                 self._is_shutdown = True
 
+        log.debug("Shutting down control connection")
         # stop trying to reconnect (if we are)
         if self._reconnection_handler:
             self._reconnection_handler.cancel()
 
         if self._connection:
             self._connection.close()
+            del self._connection
 
     def refresh_schema(self, keyspace=None, table=None):
         try:
             if self._connection:
                 self._refresh_schema(self._connection, keyspace, table)
+        except ReferenceError:
+            pass  # our weak reference to the Cluster is no good
         except Exception:
             log.debug("[control connection] Error refreshing schema", exc_info=True)
             self._signal_error()
 
-    def _refresh_schema(self, connection, keyspace=None, table=None):
-        self.wait_for_schema_agreement(connection)
+    def _refresh_schema(self, connection, keyspace=None, table=None, preloaded_results=None):
+        if self._cluster.is_shutdown:
+            return
+
+        agreed = self.wait_for_schema_agreement(connection, preloaded_results=preloaded_results)
+        if not agreed:
+            log.debug("Skipping schema refresh due to lack of schema agreement")
+            return
 
         where_clause = ""
         if keyspace:
@@ -1522,17 +1695,25 @@ class ControlConnection(object):
         try:
             if self._connection:
                 self._refresh_node_list_and_token_map(self._connection)
+        except ReferenceError:
+            pass  # our weak reference to the Cluster is no good
         except Exception:
             log.debug("[control connection] Error refreshing node list and token map", exc_info=True)
             self._signal_error()
 
-    def _refresh_node_list_and_token_map(self, connection):
-        log.debug("[control connection] Refreshing node list and token map")
-        cl = ConsistencyLevel.ONE
-        peers_query = QueryMessage(query=self._SELECT_PEERS, consistency_level=cl)
-        local_query = QueryMessage(query=self._SELECT_LOCAL, consistency_level=cl)
-        peers_result, local_result = connection.wait_for_responses(
-            peers_query, local_query, timeout=self._timeout)
+    def _refresh_node_list_and_token_map(self, connection, preloaded_results=None):
+        if preloaded_results:
+            log.debug("[control connection] Refreshing node list and token map using preloaded results")
+            peers_result = preloaded_results[0]
+            local_result = preloaded_results[1]
+        else:
+            log.debug("[control connection] Refreshing node list and token map")
+            cl = ConsistencyLevel.ONE
+            peers_query = QueryMessage(query=self._SELECT_PEERS, consistency_level=cl)
+            local_query = QueryMessage(query=self._SELECT_LOCAL, consistency_level=cl)
+            peers_result, local_result = connection.wait_for_responses(
+                peers_query, local_query, timeout=self._timeout)
+
         peers_result = dict_factory(*peers_result.results)
 
         partitioner = None
@@ -1546,13 +1727,16 @@ class ControlConnection(object):
 
             host = self._cluster.metadata.get_host(connection.host)
             if host:
-                host.set_location_info(local_row["data_center"], local_row["rack"])
+                datacenter = local_row.get("data_center")
+                rack = local_row.get("rack")
+                self._update_location_info(host, datacenter, rack)
 
             partitioner = local_row.get("partitioner")
             tokens = local_row.get("tokens")
             if partitioner and tokens:
                 token_map[host] = tokens
 
+        should_rebuild_token_map = False
         found_hosts = set()
         for row in peers_result:
             addr = row.get("rpc_address")
@@ -1564,10 +1748,14 @@ class ControlConnection(object):
             found_hosts.add(addr)
 
             host = self._cluster.metadata.get_host(addr)
+            datacenter = row.get("data_center")
+            rack = row.get("rack")
             if host is None:
                 log.debug("[control connection] Found new host to connect to: %s", addr)
-                host = self._cluster.add_host(addr, signal=True)
-            host.set_location_info(row.get("data_center"), row.get("rack"))
+                host = self._cluster.add_host(addr, datacenter, rack, signal=True)
+                should_rebuild_token_map = True
+            else:
+                should_rebuild_token_map |= self._update_location_info(host, datacenter, rack)
 
             tokens = row.get("tokens")
             if partitioner and tokens:
@@ -1578,17 +1766,31 @@ class ControlConnection(object):
                     old_host.address not in found_hosts and \
                     old_host.address not in self._cluster.contact_points:
                 log.debug("[control connection] Found host that has been removed: %r", old_host)
+                should_rebuild_token_map = True
                 self._cluster.remove_host(old_host)
 
-        if partitioner:
-            log.debug("[control connection] Fetched ring info, rebuilding metadata")
+        log.debug("[control connection] Finished fetching ring info")
+        if partitioner and should_rebuild_token_map:
+            log.debug("[control connection] Rebuilding token map due to topology changes")
             self._cluster.metadata.rebuild_token_map(partitioner, token_map)
+
+    def _update_location_info(self, host, datacenter, rack):
+        if host.datacenter == datacenter and host.rack == rack:
+            return False
+
+        # If the dc/rack information changes, we need to update the load balancing policy.
+        # For that, we remove and re-add the node against the policy. Not the most elegant, and assumes
+        # that the policy will update correctly, but in practice this should work.
+        self._cluster.load_balancing_policy.on_down(host)
+        host.set_location_info(datacenter, rack)
+        self._cluster.load_balancing_policy.on_up(host)
+        return True
 
     def _handle_topology_change(self, event):
         change_type = event["change_type"]
         addr, port = event["address"]
         if change_type == "NEW_NODE":
-            self._cluster.scheduler.schedule(10, self._cluster.add_host, addr, signal=True)
+            self._cluster.scheduler.schedule(10, self.refresh_node_list_and_token_map)
         elif change_type == "REMOVED_NODE":
             host = self._cluster.metadata.get_host(addr)
             self._cluster.scheduler.schedule(0, self._cluster.remove_host, host)
@@ -1602,10 +1804,10 @@ class ControlConnection(object):
         if change_type == "UP":
             if host is None:
                 # this is the first time we've seen the node
-                self._cluster.scheduler.schedule(1, self._cluster.add_host, addr, signal=True)
+                self._cluster.scheduler.schedule(2, self.refresh_node_list_and_token_map)
             else:
                 # this will be run by the scheduler
-                self._cluster.scheduler.schedule(1, self._cluster.on_up, host)
+                self._cluster.scheduler.schedule(2, self._cluster.on_up, host)
         elif change_type == "DOWN":
             # Note that there is a slight risk we can receive the event late and thus
             # mark the host down even though we already had reconnected successfully.
@@ -1620,11 +1822,11 @@ class ControlConnection(object):
         table = event['table'] or None
         if event['change_type'] in ("CREATED", "DROPPED"):
             keyspace = keyspace if table else None
-            self._cluster.executor.submit(self.refresh_schema, keyspace)
+            self._submit(self.refresh_schema, keyspace)
         elif event['change_type'] == "UPDATED":
-            self._cluster.executor.submit(self.refresh_schema, keyspace, table)
+            self._submit(self.refresh_schema, keyspace, table)
 
-    def wait_for_schema_agreement(self, connection=None):
+    def wait_for_schema_agreement(self, connection=None, preloaded_results=None):
         # Each schema change typically generates two schema refreshes, one
         # from the response type and one from the pushed notification. Holding
         # a lock is just a simple way to cut down on the number of schema queries
@@ -1633,14 +1835,24 @@ class ControlConnection(object):
             if self._is_shutdown:
                 return
 
-            log.debug("[control connection] Waiting for schema agreement")
             if not connection:
                 connection = self._connection
 
+            if preloaded_results:
+                log.debug("[control connection] Attempting to use preloaded results for schema agreement")
+
+                peers_result = preloaded_results[0]
+                local_result = preloaded_results[1]
+                schema_mismatches = self._get_schema_mismatches(peers_result, local_result, connection.host)
+                if schema_mismatches is None:
+                    return True
+
+            log.debug("[control connection] Waiting for schema agreement")
             start = self._time.time()
             elapsed = 0
             cl = ConsistencyLevel.ONE
             total_timeout = self._cluster.max_schema_agreement_wait
+            schema_mismatches = None
             while elapsed < total_timeout:
                 peers_query = QueryMessage(query=self._SELECT_SCHEMA_PEERS, consistency_level=cl)
                 local_query = QueryMessage(query=self._SELECT_SCHEMA_LOCAL, consistency_level=cl)
@@ -1653,36 +1865,51 @@ class ControlConnection(object):
                               "response during schema agreement check: %s", timeout)
                     elapsed = self._time.time() - start
                     continue
+                except ConnectionShutdown:
+                    if self._is_shutdown:
+                        log.debug("[control connection] Aborting wait for schema match due to shutdown")
+                        return None
+                    else:
+                        raise
 
-                peers_result = dict_factory(*peers_result.results)
-
-                versions = set()
-                if local_result.results:
-                    local_row = dict_factory(*local_result.results)[0]
-                    if local_row.get("schema_version"):
-                        versions.add(local_row.get("schema_version"))
-
-                for row in peers_result:
-                    if not row.get("rpc_address") or not row.get("schema_version"):
-                        continue
-
-                    rpc = row.get("rpc_address")
-                    if rpc == "0.0.0.0":  # TODO ipv6 check
-                        rpc = row.get("peer")
-
-                    peer = self._cluster.metadata.get_host(rpc)
-                    if peer and peer.is_up:
-                        versions.add(row.get("schema_version"))
-
-                if len(versions) == 1:
-                    log.debug("[control connection] Schemas match")
+                schema_mismatches = self._get_schema_mismatches(peers_result, local_result, connection.host)
+                if schema_mismatches is None:
                     return True
 
                 log.debug("[control connection] Schemas mismatched, trying again")
                 self._time.sleep(0.2)
                 elapsed = self._time.time() - start
 
+            log.warn("Node %s is reporting a schema disagreement: %s",
+                     connection.host, schema_mismatches)
             return False
+
+    def _get_schema_mismatches(self, peers_result, local_result, local_address):
+        peers_result = dict_factory(*peers_result.results)
+
+        versions = defaultdict(set)
+        if local_result.results:
+            local_row = dict_factory(*local_result.results)[0]
+            if local_row.get("schema_version"):
+                versions[local_row.get("schema_version")].add(local_address)
+
+        for row in peers_result:
+            if not row.get("rpc_address") or not row.get("schema_version"):
+                continue
+
+            rpc = row.get("rpc_address")
+            if rpc == "0.0.0.0":  # TODO ipv6 check
+                rpc = row.get("peer")
+
+            peer = self._cluster.metadata.get_host(rpc)
+            if peer and peer.is_up:
+                versions[row.get("schema_version")].add(rpc)
+
+        if len(versions) == 1:
+            log.debug("[control connection] Schemas match")
+            return None
+
+        return dict((version, list(nodes)) for version, nodes in six.iteritems(versions))
 
     def _signal_error(self):
         # try just signaling the cluster, as this will trigger a reconnect
@@ -1725,6 +1952,16 @@ class ControlConnection(object):
         self.refresh_node_list_and_token_map()
 
 
+def _stop_scheduler(scheduler, thread):
+    try:
+        if not scheduler.is_shutdown:
+            scheduler.shutdown()
+    except ReferenceError:
+        pass
+
+    thread.join()
+
+
 class _Scheduler(object):
 
     _scheduled = None
@@ -1739,6 +1976,10 @@ class _Scheduler(object):
         t.daemon = True
         t.start()
 
+        # although this runs on a daemonized thread, we prefer to stop
+        # it gracefully to avoid random errors during interpreter shutdown
+        atexit.register(partial(_stop_scheduler, weakref.proxy(self), t))
+
     def shutdown(self):
         try:
             log.debug("Shutting down Cluster Scheduler")
@@ -1746,7 +1987,7 @@ class _Scheduler(object):
             # this can happen on interpreter shutdown
             pass
         self.is_shutdown = True
-        self._scheduled.put_nowait((None, None))
+        self._scheduled.put_nowait((0, None))
 
     def schedule(self, delay, fn, *args, **kwargs):
         if not self.is_shutdown:
@@ -1784,7 +2025,7 @@ class _Scheduler(object):
     def _log_if_failed(self, future):
         exc = future.exception()
         if exc:
-            log.warn(
+            log.warning(
                 "An internally scheduled tasked failed with an unhandled exception:",
                 exc_info=exc)
 
@@ -1834,6 +2075,7 @@ class ResponseFuture(object):
     _query_retries = 0
     _start_time = None
     _metrics = None
+    _paging_state = None
 
     def __init__(self, session, message, query, default_timeout=None, metrics=None, prepared_statement=None):
         self.session = session
@@ -1843,23 +2085,19 @@ class ResponseFuture(object):
         self.default_timeout = default_timeout
         self._metrics = metrics
         self.prepared_statement = prepared_statement
+        self._callback_lock = Lock()
         if metrics is not None:
             self._start_time = time.time()
-
-        # convert the list/generator/etc to an iterator so that subsequent
-        # calls to send_request (which retries may do) will resume where
-        # they last left off
-        self.query_plan = iter(session._load_balancer.make_query_plan(
-            session.keyspace, query))
-
+        self._make_query_plan()
         self._event = Event()
         self._errors = {}
 
-    def __del__(self):
-        try:
-            del self.session
-        except AttributeError:
-            pass
+    def _make_query_plan(self):
+        # convert the list/generator/etc to an iterator so that subsequent
+        # calls to send_request (which retries may do) will resume where
+        # they last left off
+        self.query_plan = iter(self.session._load_balancer.make_query_plan(
+            self.session.keyspace, self.query))
 
     def send_request(self):
         """ Internal """
@@ -1894,9 +2132,15 @@ class ResponseFuture(object):
             # TODO get connectTimeout from cluster settings
             connection = pool.borrow_connection(timeout=2.0)
             request_id = connection.send_msg(message, cb=cb)
+        except NoConnectionsAvailable as exc:
+            log.debug("All connections for host %s are at capacity, moving to the next host", host)
+            self._errors[host] = exc
+            return None
         except Exception as exc:
             log.debug("Error querying host %s", host, exc_info=True)
             self._errors[host] = exc
+            if self._metrics is not None:
+                self._metrics.on_connection_error()
             if connection:
                 pool.return_connection(connection)
             return None
@@ -1905,6 +2149,37 @@ class ResponseFuture(object):
         self._current_pool = pool
         self._connection = connection
         return request_id
+
+    @property
+    def has_more_pages(self):
+        """
+        Returns :const:`True` if there are more pages left in the
+        query results, :const:`False` otherwise.  This should only
+        be checked after the first page has been returned.
+
+        .. versionadded:: 2.0.0
+        """
+        return self._paging_state is not None
+
+    def start_fetching_next_page(self):
+        """
+        If there are more pages left in the query result, this asynchronously
+        starts fetching the next page.  If there are no pages left, :exc:`.QueryExhausted`
+        is raised.  Also see :attr:`.has_more_pages`.
+
+        This should only be called after the first page has been returned.
+
+        .. versionadded:: 2.0.0
+        """
+        if not self._paging_state:
+            raise QueryExhausted()
+
+        self._make_query_plan()
+        self.message.paging_state = self._paging_state
+        self._event.clear()
+        self._final_result = _NOT_SET
+        self._final_exception = None
+        self.send_request()
 
     def _reprepare(self, prepare_message):
         cb = partial(self.session.submit, self._execute_after_prepare)
@@ -1923,7 +2198,7 @@ class ResponseFuture(object):
                 self._query_trace = QueryTrace(trace_id, self.session)
 
             if isinstance(response, ResultMessage):
-                if response.kind == ResultMessage.KIND_SET_KEYSPACE:
+                if response.kind == RESULT_KIND_SET_KEYSPACE:
                     session = getattr(self, 'session', None)
                     # since we're running on the event loop thread, we need to
                     # use a non-blocking method for setting the keyspace on
@@ -1935,7 +2210,7 @@ class ResponseFuture(object):
                     if session:
                         session._set_keyspace_for_all_pools(
                             response.results, self._set_keyspace_completed)
-                elif response.kind == ResultMessage.KIND_SCHEMA_CHANGE:
+                elif response.kind == RESULT_KIND_SCHEMA_CHANGE:
                     # refresh the schema before responding, but do it in another
                     # thread instead of the event loop thread
                     self.session.submit(
@@ -1946,7 +2221,8 @@ class ResponseFuture(object):
                         self)
                 else:
                     results = getattr(response, 'results', None)
-                    if results is not None and response.kind == ResultMessage.KIND_ROWS:
+                    if results is not None and response.kind == RESULT_KIND_ROWS:
+                        self._paging_state = response.paging_state
                         results = self.row_factory(*results)
                     self._set_final_result(results)
             elif isinstance(response, ErrorMessage):
@@ -1975,8 +2251,8 @@ class ResponseFuture(object):
                     if self._metrics is not None:
                         self._metrics.on_other_error()
                     # need to retry against a different host here
-                    log.warn("Host %s is overloaded, retrying against a different "
-                             "host", self._current_host)
+                    log.warning("Host %s is overloaded, retrying against a different "
+                                "host", self._current_host)
                     self._retry(reuse_connection=False, consistency_level=None)
                     return
                 elif isinstance(response, IsBootstrappingErrorMessage):
@@ -2081,7 +2357,7 @@ class ResponseFuture(object):
             return
 
         if isinstance(response, ResultMessage):
-            if response.kind == ResultMessage.KIND_PREPARED:
+            if response.kind == RESULT_KIND_PREPARED:
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection
                 request_id = self._query(self._current_host)
@@ -2108,12 +2384,10 @@ class ResponseFuture(object):
     def _set_final_result(self, response):
         if self._metrics is not None:
             self._metrics.request_timer.addValue(time.time() - self._start_time)
-        if hasattr(self, 'session'):
-            try:
-                del self.session  # clear reference cycles
-            except AttributeError:
-                pass
-        self._final_result = response
+
+        with self._callback_lock:
+            self._final_result = response
+
         self._event.set()
         if self._callback:
             fn, args, kwargs = self._callback
@@ -2122,11 +2396,9 @@ class ResponseFuture(object):
     def _set_final_exception(self, response):
         if self._metrics is not None:
             self._metrics.request_timer.addValue(time.time() - self._start_time)
-        try:
-            del self.session  # clear reference cycles
-        except AttributeError:
-            pass
-        self._final_exception = response
+
+        with self._callback_lock:
+            self._final_exception = response
         self._event.set()
         if self._errback:
             fn, args, kwargs = self._errback
@@ -2187,13 +2459,19 @@ class ResponseFuture(object):
             timeout = self.default_timeout
 
         if self._final_result is not _NOT_SET:
-            return self._final_result
+            if self._paging_state is None:
+                return self._final_result
+            else:
+                return PagedResult(self, self._final_result)
         elif self._final_exception:
             raise self._final_exception
         else:
             self._event.wait(timeout=timeout)
             if self._final_result is not _NOT_SET:
-                return self._final_result
+                if self._paging_state is None:
+                    return self._final_result
+                else:
+                    return PagedResult(self, self._final_result)
             elif self._final_exception:
                 raise self._final_exception
             else:
@@ -2246,10 +2524,14 @@ class ResponseFuture(object):
             >>> future.add_callback(handle_results, time.time(), should_log=True)
 
         """
-        if self._final_result is not _NOT_SET:
+        run_now = False
+        with self._callback_lock:
+            if self._final_result is not _NOT_SET:
+                run_now = True
+            else:
+                self._callback = (fn, args, kwargs)
+        if run_now:
             fn(self._final_result, *args, **kwargs)
-        else:
-            self._callback = (fn, args, kwargs)
         return self
 
     def add_errback(self, fn, *args, **kwargs):
@@ -2258,10 +2540,14 @@ class ResponseFuture(object):
         An Exception instance will be passed as the first positional argument
         to `fn`.
         """
-        if self._final_exception:
+        run_now = False
+        with self._callback_lock:
+            if self._final_exception:
+                run_now = True
+            else:
+                self._errback = (fn, args, kwargs)
+        if run_now:
             fn(self._final_exception, *args, **kwargs)
-        else:
-            self._errback = (fn, args, kwargs)
         return self
 
     def add_callbacks(self, callback, errback,
@@ -2297,3 +2583,62 @@ class ResponseFuture(object):
         return "<ResponseFuture: query='%s' request_id=%s result=%s exception=%s host=%s>" \
                % (self.query, self._req_id, result, self._final_exception, self._current_host)
     __repr__ = __str__
+
+
+class QueryExhausted(Exception):
+    """
+    Raised when :meth:`.ResponseFuture.start_fetching_next_page()` is called and
+    there are no more pages.  You can check :attr:`.ResponseFuture.has_more_pages`
+    before calling to avoid this.
+
+    .. versionadded:: 2.0.0
+    """
+    pass
+
+
+class PagedResult(object):
+    """
+    An iterator over the rows from a paged query result.  Whenever the number
+    of result rows for a query exceed the :attr:`~.query.Statement.fetch_size`
+    (or :attr:`~.Session.default_fetch_size`, if not set) an instance of this
+    class will be returned.
+
+    You can treat this as a normal iterator over rows::
+
+        >>> from cassandra.query import SimpleStatement
+        >>> statement = SimpleStatement("SELECT * FROM users", fetch_size=10)
+        >>> for user_row in session.execute(statement):
+        ...     process_user(user_row)
+
+    Whenever there are no more rows in the current page, the next page will
+    be fetched transparently.  However, note that it *is* possible for
+    an :class:`Exception` to be raised while fetching the next page, just
+    like you might see on a normal call to ``session.execute()``.
+
+    .. versionadded: 2.0.0
+    """
+
+    def __init__(self, response_future, initial_response):
+        self.response_future = response_future
+        self.current_response = iter(initial_response)
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        try:
+            return next(self.current_response)
+        except StopIteration:
+            if self.response_future._paging_state is None:
+                raise
+
+        self.response_future.start_fetching_next_page()
+        result = self.response_future.result()
+        if self.response_future.has_more_pages:
+            self.current_response = result.current_response
+        else:
+            self.current_response = iter(result)
+
+        return next(self.current_response)
+
+    __next__ = next

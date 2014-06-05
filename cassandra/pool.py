@@ -1,8 +1,23 @@
+# Copyright 2013-2014 DataStax, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Connection pooling and host management.
 """
 
 import logging
+import re
 import socket
 import time
 from threading import RLock, Condition
@@ -24,6 +39,13 @@ class NoConnectionsAvailable(Exception):
     no open connections.
     """
     pass
+
+
+# example matches:
+# 1.0.0
+# 1.0.0-beta1
+# 2.0-SNAPSHOT
+version_re = re.compile(r"(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?(?:-(?P<label>\w+))?")
 
 
 class Host(object):
@@ -49,15 +71,20 @@ class Host(object):
     up or down.
     """
 
+    version = None
+    """
+    A tuple representing the Cassandra version for this host.  This will
+    remain as :const:`None` if the version is unknown.
+    """
+
     _datacenter = None
     _rack = None
     _reconnection_handler = None
     lock = None
 
     _currently_handling_node_up = False
-    _handle_node_up_condition = None
 
-    def __init__(self, inet_address, conviction_policy_factory):
+    def __init__(self, inet_address, conviction_policy_factory, datacenter=None, rack=None):
         if inet_address is None:
             raise ValueError("inet_address may not be None")
         if conviction_policy_factory is None:
@@ -65,8 +92,8 @@ class Host(object):
 
         self.address = inet_address
         self.conviction_policy = conviction_policy_factory(self)
+        self.set_location_info(datacenter, rack)
         self.lock = RLock()
-        self._handle_node_up_condition = Condition()
 
     @property
     def datacenter(self):
@@ -86,6 +113,14 @@ class Host(object):
         """
         self._datacenter = datacenter
         self._rack = rack
+
+    def set_version(self, version_string):
+        match = version_re.match(version_string)
+        if match is not None:
+            version = [int(match.group('major')), int(match.group('minor')), int(match.group('patch') or 0)]
+            if match.group('label'):
+                version.append(match.group('label'))
+            self.version = tuple(version)
 
     def set_up(self):
         if not self.is_up:
@@ -115,8 +150,14 @@ class Host(object):
     def __eq__(self, other):
         return self.address == other.address
 
+    def __hash__(self):
+        return hash(self.address)
+
+    def __lt__(self, other):
+        return self.address < other.address
+
     def __str__(self):
-        return self.address
+        return str(self.address)
 
     def __repr__(self):
         dc = (" %s" % (self._datacenter,)) if self._datacenter else ""
@@ -140,12 +181,10 @@ class _ReconnectionHandler(object):
 
     def start(self):
         if self._cancelled:
+            log.debug("Reconnection handler was cancelled before starting")
             return
 
-        # TODO cancel previous reconnection handlers? That's probably the job
-        # of whatever created this.
-
-        first_delay = self.schedule.next()
+        first_delay = next(self.schedule)
         self.scheduler.schedule(first_delay, self.run)
 
     def run(self):
@@ -156,9 +195,20 @@ class _ReconnectionHandler(object):
         try:
             conn = self.try_reconnect()
         except Exception as exc:
-            next_delay = self.schedule.next()
+            try:
+                next_delay = next(self.schedule)
+            except StopIteration:
+                # the schedule has been exhausted
+                next_delay = None
+
+            # call on_exception for logging purposes even if next_delay is None
             if self.on_exception(exc, next_delay):
-                self.scheduler.schedule(next_delay, self.run)
+                if next_delay is None:
+                    log.warn(
+                        "Will not continue to retry reconnection attempts "
+                        "due to an exhausted retry schedule")
+                else:
+                    self.scheduler.schedule(next_delay, self.run)
         else:
             if not self._cancelled:
                 self.on_reconnection(conn)
@@ -227,8 +277,8 @@ class _HostReconnectionHandler(_ReconnectionHandler):
         if isinstance(exc, AuthenticationFailed):
             return False
         else:
-            log.warn("Error attempting to reconnect to %s, scheduling retry in %f seconds: %s",
-                     self.host, next_delay, exc)
+            log.warning("Error attempting to reconnect to %s, scheduling retry in %s seconds: %s",
+                        self.host, next_delay, exc)
             log.debug("Reconnection error details", exc_info=True)
             return True
 
@@ -338,8 +388,8 @@ class HostConnectionPool(object):
     def _create_new_connection(self):
         try:
             self._add_conn_if_under_max()
-        except (ConnectionException, socket.error), exc:
-            log.warn("Failed to create new connection to %s: %s", self.host, exc)
+        except (ConnectionException, socket.error) as exc:
+            log.warning("Failed to create new connection to %s: %s", self.host, exc)
         except Exception:
             log.exception("Unexpectedly failed to create new connection")
         finally:
@@ -371,7 +421,7 @@ class HostConnectionPool(object):
             self._signal_available_conn()
             return True
         except (ConnectionException, socket.error) as exc:
-            log.warn("Failed to add new connection to pool for host %s: %s", self.host, exc)
+            log.warning("Failed to add new connection to pool for host %s: %s", self.host, exc)
             with self._lock:
                 self.open_count -= 1
             if self._session.cluster.signal_connection_failure(self.host, exc, is_host_addition=False):
